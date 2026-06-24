@@ -1,0 +1,12 @@
+[project]
+name = "LPA-RadioSkyMapper"
+version = "0.1.0"
+description = "Sky map construction using archival LPA data"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "astroplan>=0.10.1",
+    "pillow>=12.2.0",
+    "scipy>=1.18.0",
+    "tqdm>=4.68.3",
+]
