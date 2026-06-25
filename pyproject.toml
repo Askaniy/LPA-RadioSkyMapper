@@ -1,7 +1,7 @@
 [project]
 name = "LPA-RadioSkyMapper"
 version = "0.1.0"
-description = "Sky map construction using archival LPA data"
+description = "Sky mapping using archival LPA data"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

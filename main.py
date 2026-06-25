@@ -32,7 +32,7 @@ from beam_declinations import beam_decs_110_04_MHz, beam_decs_110_45_MHz, beam_d
 
 parser = ArgumentParser(
     prog='LPA mapper',
-    description='Sky map construction using archival LPA data',
+    description='Sky mapping using archival LPA data',
     epilog='Askaniy Anpilogov, aaskaniy@gmail.com'
 )
 
@@ -114,10 +114,32 @@ shared_map_shape = (shared_map_width, n_beams, 3)
 f32size = np.dtype(np.float32).itemsize
 shared_map_size = cast(int, np.prod(shared_map_shape) * f32size) # in bytes
 
-beam_decs_mean = 0.5 * (np.array(beam_decs_110_04_MHz) + np.array(beam_decs_110_45_MHz))
-
 
 # === Helper Functions ===
+
+def RA_to_x(ra, width):
+    """ Right ascension (deg) -> Horizontal map coordinate (px) """
+    return width * (1 - ra / 360) - 0.5
+
+def x_to_RA(x, width):
+    """ Horizontal map coordinate (px) -> Right ascension (deg) """
+    return (1 - (0.5 + x) / width) * 360
+
+def dec_to_y(dec, height):
+    """ Declination (deg) -> Vertical map coordinate in the LPA's field of view (px) """
+    return (55.3 - dec) / 180 * height - 0.5
+
+def y_to_dec(y, height):
+    """ Vertical map coordinate in the LPA's field of view (px) -> Declination (deg) """
+    return 55.3 - (y + 0.5) / height * 180
+
+def dec_to_Y(dec, height):
+    """ Declination (deg) -> Vertical map coordinate (px) """
+    return (90 - dec) / 180 * height - 0.5
+
+def Y_to_dec(Y, height):
+    """ Vertical map coordinate (px) -> Declination (deg) """
+    return 90 - (Y + 0.5) / height * 180
 
 def read_pntr(file: Path|str) -> npt.NDArray:
     """
@@ -147,14 +169,6 @@ def read_pntr(file: Path|str) -> npt.NDArray:
             filled[:npoints] = data
             return filled
         raise ValueError('Undefined data length') # for type checker
-
-def dec2pixel(dec):
-    """ Converts declination (deg) to pixel coordinate """
-    return (55.3 - dec) * 10 - 0.5
-
-y_red = dec2pixel(np.array(beam_decs_109_21_MHz))
-y_green = dec2pixel(beam_decs_mean)
-y_blue = dec2pixel(np.array(beam_decs_111_29_MHz))
 
 def stretch(arr: npt.NDArray, times: int | tuple, copy=False):
     """
@@ -207,7 +221,6 @@ class Epoch:
         Calculates epoch from observation date and hour. LPA uses UTC+5 timezone, returns time in UTC.
         Tests showed inaccuracy in coordinate determination by observation time, requiring additional shift.
         """
-        # TODO: implement correction
         return Time(self.date_iso) + (self.hour - 5) * u.hour
 
     @staticmethod
@@ -297,6 +310,11 @@ def map_worker(
     shared_calib_memory = SharedMemory(name=shared_calib_memory_name)
     shared_map = np.ndarray(shared_map_shape, dtype=np.float32, buffer=shared_map_memory.buf)
     shared_calib = np.ndarray(shared_calib_shape, dtype=np.float32, buffer=shared_calib_memory.buf)
+    # Calculate pixel coordinates of the beams
+    beam_decs_mean = 0.5 * (np.array(beam_decs_110_04_MHz) + np.array(beam_decs_110_45_MHz))
+    beams_px_R = dec_to_y(np.array(beam_decs_109_21_MHz), final_map_width)
+    beams_px_G = dec_to_y(beam_decs_mean, final_map_width)
+    beams_px_B = dec_to_y(np.array(beam_decs_111_29_MHz), final_map_width)
     while True:
         # Wait for task
         task = task_queue.get()
@@ -360,9 +378,9 @@ def map_worker(
             # Should try ridge regression (Tikhonov regularization with identity matrix)
             arr = np.clip(np.nan_to_num(arr) / y_max_typical, 0, 1) ** (1/3)
             final_map = np.empty((final_map_height, final_map_width, 3), dtype=np.float32)
-            final_map[..., 0] = CubicSpline(y_red,   arr[..., 0], bc_type='natural')(final_map_y_centered)
-            final_map[..., 1] = CubicSpline(y_green, arr[..., 1], bc_type='natural')(final_map_y_centered)
-            final_map[..., 2] = CubicSpline(y_blue,  arr[..., 2], bc_type='natural')(final_map_y_centered)
+            final_map[..., 0] = CubicSpline(beams_px_R, arr[..., 0], bc_type='natural')(final_map_y_centered)
+            final_map[..., 1] = CubicSpline(beams_px_G, arr[..., 1], bc_type='natural')(final_map_y_centered)
+            final_map[..., 2] = CubicSpline(beams_px_B, arr[..., 2], bc_type='natural')(final_map_y_centered)
             final_map = y_max_typical * final_map * final_map * final_map # fast inverse gamma correction
 
             # Save image
