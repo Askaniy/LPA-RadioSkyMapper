@@ -16,6 +16,7 @@ import numpy as np
 import numpy.typing as npt
 from math import floor
 # Astronomic calculations
+import erfa
 import datetime as dt
 import astropy.units as u
 from astropy.time import Time
@@ -24,6 +25,7 @@ from astroplan import Observer, FixedTarget
 # Image processing
 from PIL import Image
 from scipy.interpolate import CubicSpline
+from scipy.ndimage import map_coordinates
 # LPA data
 from beam_declinations import beam_decs_110_04_MHz, beam_decs_110_45_MHz, beam_decs_109_21_MHz, beam_decs_111_29_MHz
 
@@ -67,9 +69,11 @@ y_max_typical = 128 # only the Sun during flares is brighter
 # - Map parameters
 final_map_width = 3600
 final_map_height = 645
-final_map_x_centered = 0.5 + np.arange(final_map_width)
-final_map_x_edges = np.arange(0, final_map_width+1)
-final_map_y_centered = 0.5 + np.arange(final_map_height)
+prefinal_map_width = 2 * final_map_width
+prefinal_map_height = 2 * final_map_height
+prefinal_map_x_edges = np.arange(0, prefinal_map_width+1)
+prefinal_map_x_centered = 0.5 + np.arange(prefinal_map_width)
+prefinal_map_y_centered = 0.5 + np.arange(prefinal_map_height)
 
 # - Data parameters
 hour_width0 = 36018 # reference number of points per file
@@ -125,21 +129,21 @@ def x_to_RA(x, width):
     """ Horizontal map coordinate (px) -> Right ascension (deg) """
     return (1 - (0.5 + x) / width) * 360
 
-def dec_to_y(dec, height):
+def dec_to_y(dec, width):
     """ Declination (deg) -> Vertical map coordinate in the LPA's field of view (px) """
-    return (55.3 - dec) / 180 * height - 0.5
+    return (55.3 - dec) / 360 * width - 0.5
 
-def y_to_dec(y, height):
+def y_to_dec(y, width):
     """ Vertical map coordinate in the LPA's field of view (px) -> Declination (deg) """
-    return 55.3 - (y + 0.5) / height * 180
+    return 55.3 - (y + 0.5) / width * 360
 
-def dec_to_Y(dec, height):
+def dec_to_Y(dec, width):
     """ Declination (deg) -> Vertical map coordinate (px) """
-    return (90 - dec) / 180 * height - 0.5
+    return (90 - dec) / 360 * width - 0.5
 
-def Y_to_dec(Y, height):
+def Y_to_dec(Y, width):
     """ Vertical map coordinate (px) -> Declination (deg) """
-    return 90 - (Y + 0.5) / height * 180
+    return 90 - (Y + 0.5) / width * 360
 
 def read_pntr(file: Path|str) -> npt.NDArray:
     """
@@ -221,7 +225,7 @@ class Epoch:
         Calculates epoch from observation date and hour. LPA uses UTC+5 timezone, returns time in UTC.
         Tests showed inaccuracy in coordinate determination by observation time, requiring additional shift.
         """
-        return Time(self.date_iso) + (self.hour - 5) * u.hour
+        return Time(self.date_iso) + (self.hour - 5) * u.hour + 360 * u.s
 
     @staticmethod
     def generator(start_obj: dt.datetime, end_obj: dt.datetime) -> Generator:
@@ -312,9 +316,22 @@ def map_worker(
     shared_calib = np.ndarray(shared_calib_shape, dtype=np.float32, buffer=shared_calib_memory.buf)
     # Calculate pixel coordinates of the beams
     beam_decs_mean = 0.5 * (np.array(beam_decs_110_04_MHz) + np.array(beam_decs_110_45_MHz))
-    beams_px_R = dec_to_y(np.array(beam_decs_109_21_MHz), final_map_width)
-    beams_px_G = dec_to_y(beam_decs_mean, final_map_width)
-    beams_px_B = dec_to_y(np.array(beam_decs_111_29_MHz), final_map_width)
+    beams_px_R = dec_to_y(np.array(beam_decs_109_21_MHz), prefinal_map_width)
+    beams_px_G = dec_to_y(beam_decs_mean, prefinal_map_width)
+    beams_px_B = dec_to_y(np.array(beam_decs_111_29_MHz), prefinal_map_width)
+    # Precompute J2000 coordinate grid for interpolation
+    ra = np.radians(x_to_RA(prefinal_map_x_centered, prefinal_map_width))
+    dec = np.radians(y_to_dec(prefinal_map_y_centered, prefinal_map_width))
+    rra, ddec = np.meshgrid(ra, dec)
+    cos_ddec = np.cos(ddec)
+    xyz_J2000 = np.stack(
+        (
+            cos_ddec * np.cos(rra),
+            cos_ddec * np.sin(rra),
+            np.sin(ddec)
+        ),
+        axis=0
+    )
     while True:
         # Wait for task
         task = task_queue.get()
@@ -331,7 +348,7 @@ def map_worker(
 
             # Define time coordinates on the map
             map_times = epoch0_mjd + (0.5 + map_indices) * hour_width1_step
-            map_scale = final_map_width / (mjd1 - mjd0) # map scale
+            map_scale = prefinal_map_width / (mjd1 - mjd0) # map scale
             x0 = map_scale * (mjd1 - np.flip(map_times, axis=0))
             step_coords = map_scale * (mjd1 - np.flip(calib_mjds[calib_idx0:calib_idx1], axis=0))
 
@@ -349,23 +366,18 @@ def map_worker(
             y_cdf = np.zeros(y0.shape, dtype=np.float64)
             y_cdf[1:] = np.cumsum(0.5 * (y0[:-1] + y0[1:]) * x0_diff, axis=0) # Riemann sum
             # Binning the cumulative distribution
-            arr = np.diff(linear_interp(x0, y_cdf, final_map_x_edges), axis=0).astype(np.float32)
-            assert arr.shape == (final_map_width, n_beams, 3)
+            arr = np.diff(linear_interp(x0, y_cdf, prefinal_map_x_edges), axis=0).astype(np.float32)
 
             # Interpolation and calibration by steps
             calib_light = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 0], axis=0)
             calib_dark = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 1], axis=0)
-            calib_lights = CubicSpline(step_coords, calib_light, bc_type='natural')(final_map_x_centered).astype(np.float32)
-            calib_darks = CubicSpline(step_coords, calib_dark, bc_type='natural')(final_map_x_centered).astype(np.float32)
+            calib_lights = CubicSpline(step_coords, calib_light, bc_type='natural')(prefinal_map_x_centered).astype(np.float32)
+            calib_darks = CubicSpline(step_coords, calib_dark, bc_type='natural')(prefinal_map_x_centered).astype(np.float32)
             calib_lights -= calib_darks
             arr = (arr - calib_darks) / calib_lights
 
             # Swap axes: for interpolation and Pillow, height must come first, then width
             arr = arr.swapaxes(0, 1)
-
-            # Final adequacy check
-            assert arr.shape == (n_beams, final_map_width, 3)
-            assert arr.dtype == np.float32
 
             # Round MJD to slightly excessive precision ~1s (grid step ~24s)
             mjd1_str = str(round(mjd1, 5))
@@ -377,11 +389,34 @@ def map_worker(
             # Gamma correction as a temporary solution to help the spline
             # Should try ridge regression (Tikhonov regularization with identity matrix)
             arr = np.clip(np.nan_to_num(arr) / y_max_typical, 0, 1) ** (1/3)
-            final_map = np.empty((final_map_height, final_map_width, 3), dtype=np.float32)
-            final_map[..., 0] = CubicSpline(beams_px_R, arr[..., 0], bc_type='natural')(final_map_y_centered)
-            final_map[..., 1] = CubicSpline(beams_px_G, arr[..., 1], bc_type='natural')(final_map_y_centered)
-            final_map[..., 2] = CubicSpline(beams_px_B, arr[..., 2], bc_type='natural')(final_map_y_centered)
-            final_map = y_max_typical * final_map * final_map * final_map # fast inverse gamma correction
+            final_map = np.empty((prefinal_map_height, prefinal_map_width, 3), dtype=np.float32)
+            final_map[..., 0] = CubicSpline(beams_px_R, arr[..., 0], bc_type='natural')(prefinal_map_y_centered)
+            final_map[..., 1] = CubicSpline(beams_px_G, arr[..., 1], bc_type='natural')(prefinal_map_y_centered)
+            final_map[..., 2] = CubicSpline(beams_px_B, arr[..., 2], bc_type='natural')(prefinal_map_y_centered)
+            final_map = y_max_typical * final_map**3 # fast inverse gamma correction
+
+            # Reprojection to compensate for precession and nutation
+            # A rotation matrix is used to convert coordinates to the J2000 epoch
+            mean_epoch = Time((mjd0 + mjd1) / 2, format='mjd')
+            rot_matrix = erfa.pnm06a(mean_epoch.tt.jd1, mean_epoch.tt.jd2)
+            xyz_on_epoch = np.einsum('ij, jkl -> ikl', rot_matrix, xyz_J2000)
+            ra_on_epoch = np.rad2deg(np.arctan2(xyz_on_epoch[1], xyz_on_epoch[0])) % 360
+            dec_on_epoch = np.rad2deg(np.arcsin(xyz_on_epoch[2]))
+            x_on_epoch = RA_to_x(ra_on_epoch, prefinal_map_width)
+            y_on_epoch = dec_to_y(dec_on_epoch, prefinal_map_width)
+            for channel in range(3):
+                final_map[..., channel] = map_coordinates(
+                    final_map[..., channel],
+                    (y_on_epoch, x_on_epoch),
+                    order=2,
+                    mode='wrap',
+                    prefilter=False,
+                )
+
+            # Median filtering, 4x compression
+            # After reprojection, the map becomes less clear
+            # Therefore, it is performed at a higher resolution so that the map can then be compressed again
+            final_map = np.median(final_map.reshape(final_map_height, 2, final_map_width, 2, 3), axis=(1, 3))
 
             # Save image
             img = Image.fromarray((gamma_correction(np.clip(final_map / y_max_preview, 0, 1)) * 255).astype('uint8'), mode='RGB')
@@ -583,7 +618,7 @@ def main_process(start_date: str, end_date: str):
 
     try:
         # Process in 4-hour chunks
-        with tqdm(total=n_hours, desc='Number of processed observation hours') as pbar:
+        with tqdm(total=n_hours, desc='Number of processed hours') as pbar:
             for n_start in range(0, n_hours, hours_per_chunk):
                 n_end = n_start + hours_per_chunk
 
