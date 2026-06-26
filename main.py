@@ -71,9 +71,9 @@ final_map_width = 3600
 final_map_height = 645
 prefinal_map_width = 2 * final_map_width
 prefinal_map_height = 2 * final_map_height
+prefinal_map_x = 0.5 + np.arange(prefinal_map_width)
+prefinal_map_y = 0.5 + np.arange(prefinal_map_height)
 prefinal_map_x_edges = np.arange(0, prefinal_map_width+1)
-prefinal_map_x_centered = 0.5 + np.arange(prefinal_map_width)
-prefinal_map_y_centered = 0.5 + np.arange(prefinal_map_height)
 
 # - Data parameters
 hour_width0 = 36018 # reference number of points per file
@@ -122,28 +122,28 @@ shared_map_size = cast(int, np.prod(shared_map_shape) * f32size) # in bytes
 # === Helper Functions ===
 
 def RA_to_x(ra, width):
-    """ Right ascension (deg) -> Horizontal map coordinate (px) """
-    return width * (1 - ra / 360) - 0.5
+    """ Right ascension (deg) -> Horizontal map coordinate (px center) """
+    return width * (1 - ra / 360)
 
 def x_to_RA(x, width):
-    """ Horizontal map coordinate (px) -> Right ascension (deg) """
-    return (1 - (0.5 + x) / width) * 360
+    """ Horizontal map coordinate (px center) -> Right ascension (deg) """
+    return (1 - x / width) * 360
 
 def dec_to_y(dec, width):
-    """ Declination (deg) -> Vertical map coordinate in the LPA's field of view (px) """
-    return (55.3 - dec) / 360 * width - 0.5
+    """ Declination (deg) -> Vertical map coordinate in the LPA's field of view (px center) """
+    return (55.25 - dec) / 360 * width
 
 def y_to_dec(y, width):
-    """ Vertical map coordinate in the LPA's field of view (px) -> Declination (deg) """
-    return 55.3 - (y + 0.5) / width * 360
+    """ Vertical map coordinate in the LPA's field of view (px center) -> Declination (deg) """
+    return 55.25 - y / width * 360
 
 def dec_to_Y(dec, width):
-    """ Declination (deg) -> Vertical map coordinate (px) """
-    return (90 - dec) / 360 * width - 0.5
+    """ Declination (deg) -> Vertical map coordinate (px center) """
+    return (90 - dec) / 360 * width
 
 def Y_to_dec(Y, width):
-    """ Vertical map coordinate (px) -> Declination (deg) """
-    return 90 - (Y + 0.5) / width * 360
+    """ Vertical map coordinate (px center) -> Declination (deg) """
+    return 90 - Y / width * 360
 
 def read_pntr(file: Path|str) -> npt.NDArray:
     """
@@ -320,8 +320,8 @@ def map_worker(
     beams_px_G = dec_to_y(beam_decs_mean, prefinal_map_width)
     beams_px_B = dec_to_y(np.array(beam_decs_111_29_MHz), prefinal_map_width)
     # Precompute J2000 coordinate grid for interpolation
-    ra = np.radians(x_to_RA(prefinal_map_x_centered, prefinal_map_width))
-    dec = np.radians(y_to_dec(prefinal_map_y_centered, prefinal_map_width))
+    ra = np.radians(x_to_RA(prefinal_map_x, prefinal_map_width))
+    dec = np.radians(y_to_dec(prefinal_map_y, prefinal_map_width))
     rra, ddec = np.meshgrid(ra, dec)
     cos_ddec = np.cos(ddec)
     xyz_J2000 = np.stack(
@@ -371,8 +371,8 @@ def map_worker(
             # Interpolation and calibration by steps
             calib_light = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 0], axis=0)
             calib_dark = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 1], axis=0)
-            calib_lights = CubicSpline(step_coords, calib_light, bc_type='natural')(prefinal_map_x_centered).astype(np.float32)
-            calib_darks = CubicSpline(step_coords, calib_dark, bc_type='natural')(prefinal_map_x_centered).astype(np.float32)
+            calib_lights = CubicSpline(step_coords, calib_light, bc_type='natural')(prefinal_map_x).astype(np.float32)
+            calib_darks = CubicSpline(step_coords, calib_dark, bc_type='natural')(prefinal_map_x).astype(np.float32)
             calib_lights -= calib_darks
             arr = (arr - calib_darks) / calib_lights
 
@@ -390,9 +390,9 @@ def map_worker(
             # Should try ridge regression (Tikhonov regularization with identity matrix)
             arr = np.clip(np.nan_to_num(arr) / y_max_typical, 0, 1) ** (1/3)
             final_map = np.empty((prefinal_map_height, prefinal_map_width, 3), dtype=np.float32)
-            final_map[..., 0] = CubicSpline(beams_px_R, arr[..., 0], bc_type='natural')(prefinal_map_y_centered)
-            final_map[..., 1] = CubicSpline(beams_px_G, arr[..., 1], bc_type='natural')(prefinal_map_y_centered)
-            final_map[..., 2] = CubicSpline(beams_px_B, arr[..., 2], bc_type='natural')(prefinal_map_y_centered)
+            final_map[..., 0] = CubicSpline(beams_px_R, arr[..., 0], bc_type='natural')(prefinal_map_y)
+            final_map[..., 1] = CubicSpline(beams_px_G, arr[..., 1], bc_type='natural')(prefinal_map_y)
+            final_map[..., 2] = CubicSpline(beams_px_B, arr[..., 2], bc_type='natural')(prefinal_map_y)
             final_map = y_max_typical * final_map**3 # fast inverse gamma correction
 
             # Reprojection to compensate for precession and nutation
