@@ -26,8 +26,6 @@ from astroplan import Observer, FixedTarget
 from PIL import Image
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import map_coordinates
-# LPA data
-from beam_declinations import beam_decs_110_04_MHz, beam_decs_110_45_MHz, beam_decs_109_21_MHz, beam_decs_111_29_MHz
 
 
 # === Console Input Processing ===
@@ -63,7 +61,7 @@ calibs_path = save_path/'calibs'
 # === Script Settings ===
 
 # - Maximum brightness in calibration step units
-y_max_preview = 2   # almost all sources are dimmer
+y_max_preview = 4   # almost all sources are dimmer
 y_max_typical = 128 # only the Sun during flares is brighter
 
 # - Map parameters
@@ -102,6 +100,16 @@ beam_slices = (
 )
 n_regs = len(beam_slices)
 range_regs = range(n_regs)
+n_channels = 6
+range_channels = range(n_channels)
+
+# - Color procession
+# Matrix to compress 6 channels into 3 colors
+rgb_matrix = np.array((
+    (3, 2, 1, 0, 0, 0),
+    (0, 1, 2, 2, 1, 0),
+    (0, 0, 0, 1, 2, 3)
+)) / 3
 
 # - Multiprocessing parameters
 n_workers = args.workers # from 1 to 12
@@ -114,7 +122,7 @@ range_works = range(n_works)
 # Maximum map buffer size — 36 hours:
 # 24h map + 8h calibration step + 4h buffer
 shared_map_width = hour_width1 * 36
-shared_map_shape = (shared_map_width, n_beams, 3)
+shared_map_shape = (shared_map_width, n_beams, n_channels)
 f32size = np.dtype(np.float32).itemsize
 shared_map_size = cast(int, np.prod(shared_map_shape) * f32size) # in bytes
 
@@ -315,10 +323,8 @@ def map_worker(
     shared_map = np.ndarray(shared_map_shape, dtype=np.float32, buffer=shared_map_memory.buf)
     shared_calib = np.ndarray(shared_calib_shape, dtype=np.float32, buffer=shared_calib_memory.buf)
     # Calculate pixel coordinates of the beams
-    beam_decs_mean = 0.5 * (np.array(beam_decs_110_04_MHz) + np.array(beam_decs_110_45_MHz))
-    beams_px_R = dec_to_y(np.array(beam_decs_109_21_MHz), prefinal_map_width)
-    beams_px_G = dec_to_y(beam_decs_mean, prefinal_map_width)
-    beams_px_B = dec_to_y(np.array(beam_decs_111_29_MHz), prefinal_map_width)
+    beam_decs = np.loadtxt('beam_declinations.tsv').T # (6, 128)
+    beam_pixels = dec_to_y(beam_decs, prefinal_map_width)
     # Precompute J2000 coordinate grid for interpolation
     ra = np.radians(x_to_RA(prefinal_map_x, prefinal_map_width))
     dec = np.radians(y_to_dec(prefinal_map_y, prefinal_map_width))
@@ -386,10 +392,9 @@ def map_worker(
             # Gamma correction as a temporary solution to help the spline
             # Should try ridge regression (Tikhonov regularization with identity matrix)
             arr = np.clip(np.nan_to_num(arr) / y_max_typical, 0, 1) ** (1/3)
-            final_map = np.empty((prefinal_map_height, prefinal_map_width, 3), dtype=np.float32)
-            final_map[..., 0] = CubicSpline(beams_px_R, arr[..., 0], bc_type='natural')(prefinal_map_y)
-            final_map[..., 1] = CubicSpline(beams_px_G, arr[..., 1], bc_type='natural')(prefinal_map_y)
-            final_map[..., 2] = CubicSpline(beams_px_B, arr[..., 2], bc_type='natural')(prefinal_map_y)
+            final_map = np.empty((prefinal_map_height, prefinal_map_width, n_channels), dtype=np.float32)
+            for channel in range_channels:
+                final_map[..., channel] = CubicSpline(beam_pixels[channel], arr[..., channel], bc_type='natural')(prefinal_map_y)
             final_map = y_max_typical * final_map**3 # fast inverse gamma correction
 
             # Reprojection to compensate for precession and nutation
@@ -401,7 +406,7 @@ def map_worker(
             dec_on_epoch = np.rad2deg(np.arcsin(xyz_on_epoch[2]))
             x_on_epoch = RA_to_x(ra_on_epoch, prefinal_map_width)
             y_on_epoch = dec_to_y(dec_on_epoch, prefinal_map_width)
-            for channel in range(3):
+            for channel in range_channels:
                 final_map[..., channel] = map_coordinates(
                     final_map[..., channel],
                     (y_on_epoch, x_on_epoch),
@@ -413,10 +418,14 @@ def map_worker(
             # Median filtering, 4x compression
             # After reprojection, the map becomes less clear
             # Therefore, it is performed at a higher resolution so that the map can then be compressed again
-            final_map = np.mean(final_map.reshape(final_map_height, 2, final_map_width, 2, 3), axis=(1, 3))
+            final_map = np.mean(final_map.reshape(final_map_height, 2, final_map_width, 2, n_channels), axis=(1, 3))
 
             # Save map array
             np.savez_compressed(arrays_path/f'array_{mjd1_str}.npz', data=arr)
+
+            # Uniform compression of six channels into three colors
+            # Each color accounts for one-third of the total flow
+            final_map = np.einsum('ij, klj -> kli', rgb_matrix, final_map)
 
             # Save map image
             img = Image.fromarray((gamma_correction(np.clip(final_map / y_max_preview, 0, 1)) * 255).astype('uint8'), mode='RGB')
@@ -475,15 +484,8 @@ def reg_worker(
             if file is None:
                 raise FileNotFoundError(f'Files of type {base_name}_**.pnt not found!')
 
-            # Read recorder data
-            data_6_bands = read_pntr(file) # shape [time, beam, channel]
-
-            # Select first (109.21 MHz), middle average (110.245 MHz), and last (111.29 MHz) channels
-            # These are 2.7470, 2.7212 and 2.6957 meters, which are then interpreted as R, G, and B.
-            data = np.empty(data_6_bands.shape[:-1] + (3,), dtype=np.float32)
-            data[..., 0] = data_6_bands[..., 0]
-            data[..., 1] = (data_6_bands[..., 2] + data_6_bands[..., 3]) / 2
-            data[..., 2] = data_6_bands[..., 5]
+            # Read recorder data, skip the last (aggregate) channel
+            data = read_pntr(file)[..., :-1] # shape [time, beam, channel]
 
             # Measure calibration steps
             if epoch.hour in calib_hours:
@@ -560,7 +562,7 @@ def main_process(start_date: str, end_date: str):
 
     # Create array of all calibration steps
     # [step number, beam, channel, light/dark]
-    shared_calib_shape = (calib_mjds.size, n_beams, 3, 2)
+    shared_calib_shape = (calib_mjds.size, n_beams, n_channels, 2)
     shared_calib_size = cast(int, np.prod(shared_calib_shape) * f32size) # in bytes
     shared_calib_memory = SharedMemory(create=True, size=shared_calib_size)
     shared_calib_array = np.ndarray(shared_calib_shape, dtype=np.float32, buffer=shared_calib_memory.buf)
