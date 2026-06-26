@@ -40,7 +40,7 @@ parser.add_argument('date1', type=str, help='Start date of observation interval 
 parser.add_argument('date2', type=str, help='End date in YYYY-MM-DD format')
 parser.add_argument('--data_path', type=str, default='/bsa_b/',
                     help='Root directory path for LPA data (default: /bsa_b/)')
-parser.add_argument('--workers', type=int, default=12,
+parser.add_argument('--workers', type=int, default=6,
                     help='Number of parallel processes for reading recorder data (from 1 to 12)')
 
 args = parser.parse_args()
@@ -61,8 +61,8 @@ calibs_path = save_path/'calibs'
 # === Script Settings ===
 
 # - Maximum brightness in calibration step units
-y_max_preview = 4   # almost all sources are dimmer
-y_max_typical = 128 # only the Sun during flares is brighter
+br_max_preview = 4   # almost all sources are dimmer
+br_max_typical = 128 # only the Sun during flares is brighter
 
 # - Map parameters
 final_map_width = 3600
@@ -112,11 +112,13 @@ rgb_matrix = np.array((
 )) / 3
 
 # - Multiprocessing parameters
-n_workers = args.workers # from 1 to 12
+n_reg_workers = args.workers # from 1 to 12
+range_reg_workers = range(n_reg_workers) # worker pool
 hours_per_chunk = 4
-range_reg_workers = range(n_workers) # worker pool
 n_works = hours_per_chunk * n_regs
 range_works = range(n_works)
+n_map_workers = 2
+range_map_workers = range(n_map_workers)
 
 # - Shared memory parameters
 # Maximum map buffer size — 36 hours:
@@ -391,11 +393,11 @@ def map_worker(
             # Interpolate map channels in height across all pixel values
             # Gamma correction as a temporary solution to help the spline
             # Should try ridge regression (Tikhonov regularization with identity matrix)
-            arr = np.clip(np.nan_to_num(arr) / y_max_typical, 0, 1) ** (1/3)
+            arr = np.clip(np.nan_to_num(arr) / br_max_typical, 0, 1) ** (1/3)
             final_map = np.empty((prefinal_map_height, prefinal_map_width, n_channels), dtype=np.float32)
             for channel in range_channels:
                 final_map[..., channel] = CubicSpline(beam_pixels[channel], arr[..., channel], bc_type='natural')(prefinal_map_y)
-            final_map = y_max_typical * final_map**3 # fast inverse gamma correction
+            final_map = br_max_typical * final_map**3 # fast inverse gamma correction
 
             # Reprojection to compensate for precession and nutation
             # A rotation matrix is used to convert coordinates to the J2000 epoch
@@ -421,14 +423,14 @@ def map_worker(
             final_map = np.mean(final_map.reshape(final_map_height, 2, final_map_width, 2, n_channels), axis=(1, 3))
 
             # Save map array
-            np.savez_compressed(arrays_path/f'array_{mjd1_str}.npz', data=arr)
+            np.savez_compressed(arrays_path/f'array_{mjd1_str}.npz', data=final_map)
 
             # Uniform compression of six channels into three colors
             # Each color accounts for one-third of the total flow
             final_map = np.einsum('ij, klj -> kli', rgb_matrix, final_map)
 
             # Save map image
-            img = Image.fromarray((gamma_correction(np.clip(final_map / y_max_preview, 0, 1)) * 255).astype('uint8'), mode='RGB')
+            img = Image.fromarray((gamma_correction(np.clip(final_map / br_max_preview, 0, 1)) * 255).astype('uint8'))
             img.save(images_path/f'image_{mjd1_str}.png')
 
             # Inform main process that worker finished the map
@@ -576,34 +578,36 @@ def main_process(start_date: str, end_date: str):
     shared_map_array = np.ndarray(shared_map_shape, dtype=np.float32, buffer=shared_map_memory.buf)
     shared_map_array.fill(0)
 
-    # Create queues for reading recorder data
+    # Create queues for recorder data readers
     reg_task_queue = mp.Queue()
     reg_result_queue = mp.Queue()
 
-    # Create map generator queue
+    # Create queues for map generators
     map_task_queue = mp.Queue()
     map_result_queue = mp.Queue()
 
-    # Start the map generation worker
-    map_process = mp.Process(
-        target=map_worker,
-        args=(
-            map_task_queue,
-            map_result_queue,
-            shared_map_memory.name,
-            shared_calib_memory.name,
-            shared_calib_shape,
-            epoch0_mjd,
-            calib_mjds
-        ),
-        name='MapWorker'
-    )
-    map_process.start()
+    # Start map worker pool
+    map_processes = []
+    for i in range_map_workers:
+        p = mp.Process(
+            target=map_worker,
+            args=(
+                map_task_queue,
+                map_result_queue,
+                shared_map_memory.name,
+                shared_calib_memory.name,
+                shared_calib_shape,
+                epoch0_mjd,
+                calib_mjds
+            ),
+            name=f'MapWorker_{i}'
+        )
+        p.start()
+        map_processes.append(p)
 
     # Start recorder worker pool
-    # (Process creation is expensive in Python)
     reg_processes = []
-    for n_reg in range_reg_workers:
+    for i in range_reg_workers:
         p = mp.Process(
             target=reg_worker,
             args=(
@@ -613,10 +617,12 @@ def main_process(start_date: str, end_date: str):
                 shared_calib_memory.name,
                 shared_calib_shape,
             ),
-            name=f'RegWorker_{n_reg}'
+            name=f'RegWorker_{i}'
         )
         p.start()
         reg_processes.append(p)
+
+    all_processes = (*map_processes, *reg_processes)
 
     try:
         # Process in 4-hour chunks
@@ -635,8 +641,9 @@ def main_process(start_date: str, end_date: str):
 
                 while completed_works < n_works:
                     # Check if any worker died
-                    if not map_process.is_alive():
-                        raise RuntimeError('Map processing process crashed!')
+                    for i, p in enumerate(map_processes):
+                        if not p.is_alive():
+                            raise RuntimeError(f'Map process {i} crashed!')
                     for i, p in enumerate(reg_processes):
                         if not p.is_alive():
                             raise RuntimeError(f'Recorder process {i} crashed!')
@@ -708,11 +715,12 @@ def main_process(start_date: str, end_date: str):
         except FileNotFoundError:
             pass
 
-        # Wait five more seconds for the MapWorker
-        map_process.join(timeout=5)
+        # Wait five more seconds for the MapWorkers
+        for map_p in map_processes:
+            map_p.join(timeout=10)
 
         # If processes are still hanging, kill them forcibly
-        for p in (map_process, *reg_processes):
+        for p in all_processes:
             if p.is_alive():
                 print(f'Process {p.name} did not respond. Forcing termination...')
                 p.terminate() # Fast kill
