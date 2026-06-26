@@ -33,7 +33,7 @@ from beam_declinations import beam_decs_110_04_MHz, beam_decs_110_45_MHz, beam_d
 # === Console Input Processing ===
 
 parser = ArgumentParser(
-    prog='LPA mapper',
+    prog='LPA mapping script',
     description='Sky mapping using archival LPA data',
     epilog='Askaniy Anpilogov, aaskaniy@gmail.com'
 )
@@ -53,7 +53,7 @@ args = parser.parse_args()
 # - LPA data path
 data_path = Path(args.data_path)
 
-# - Image saving path
+# - Result saving paths
 save_path = Path(__file__).resolve().parent
 arrays_path = save_path/'arrays'
 images_path = save_path/'images'
@@ -225,7 +225,7 @@ class Epoch:
         Calculates epoch from observation date and hour. LPA uses UTC+5 timezone, returns time in UTC.
         Tests showed inaccuracy in coordinate determination by observation time, requiring additional shift.
         """
-        return Time(self.date_iso) + (self.hour - 5) * u.hour + 360 * u.s
+        return Time(self.date_iso) + (self.hour - 5) * u.hour # + 360 * u.s
 
     @staticmethod
     def generator(start_obj: dt.datetime, end_obj: dt.datetime) -> Generator:
@@ -382,9 +382,6 @@ def map_worker(
             # Round MJD to slightly excessive precision ~1s (grid step ~24s)
             mjd1_str = str(round(mjd1, 5))
 
-            # Save map array
-            np.savez_compressed(arrays_path/f'array_{mjd1_str}.npz', arr)
-
             # Interpolate map channels in height across all pixel values
             # Gamma correction as a temporary solution to help the spline
             # Should try ridge regression (Tikhonov regularization with identity matrix)
@@ -416,9 +413,12 @@ def map_worker(
             # Median filtering, 4x compression
             # After reprojection, the map becomes less clear
             # Therefore, it is performed at a higher resolution so that the map can then be compressed again
-            final_map = np.median(final_map.reshape(final_map_height, 2, final_map_width, 2, 3), axis=(1, 3))
+            final_map = np.mean(final_map.reshape(final_map_height, 2, final_map_width, 2, 3), axis=(1, 3))
 
-            # Save image
+            # Save map array
+            np.savez_compressed(arrays_path/f'array_{mjd1_str}.npz', data=arr)
+
+            # Save map image
             img = Image.fromarray((gamma_correction(np.clip(final_map / y_max_preview, 0, 1)) * 255).astype('uint8'), mode='RGB')
             img.save(images_path/f'image_{mjd1_str}.png')
 
