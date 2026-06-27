@@ -2,6 +2,7 @@
 arrays/
 images/
 calibs/
+stacks/
 
 # Python-generated files
 __pycache__/

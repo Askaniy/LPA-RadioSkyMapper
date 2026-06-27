@@ -61,7 +61,7 @@ calibs_path = save_path/'calibs'
 # === Script Settings ===
 
 # - Maximum brightness in calibration step units
-br_max_preview = 4   # almost all sources are dimmer
+br_max_preview = 2   # almost all sources are dimmer
 br_max_typical = 128 # only the Sun during flares is brighter
 
 # - Map parameters
@@ -109,7 +109,7 @@ rgb_matrix = np.array((
     (3, 2, 1, 0, 0, 0),
     (0, 1, 2, 2, 1, 0),
     (0, 0, 0, 1, 2, 3)
-)) / 3
+)) / 6
 
 # - Multiprocessing parameters
 n_reg_workers = args.workers # from 1 to 12
@@ -427,11 +427,13 @@ def map_worker(
 
             # Uniform compression of six channels into three colors
             # Each color accounts for one-third of the total flow
-            final_map = np.einsum('ij, klj -> kli', rgb_matrix, final_map)
+            final_map = np.einsum('ij, klj -> kli', rgb_matrix, final_map) / br_max_preview
+
+            # Compress into standard color depth
+            final_map = np.round(gamma_correction(np.clip(final_map, 0, 1)) * 255).astype(np.uint8)
 
             # Save map image
-            img = Image.fromarray((gamma_correction(np.clip(final_map / br_max_preview, 0, 1)) * 255).astype('uint8'))
-            img.save(images_path/f'image_{mjd1_str}.png')
+            Image.fromarray(final_map).save(images_path/f'image_{mjd1_str}.png')
 
             # Inform main process that worker finished the map
             result_queue.put((True, mjd1_str))
