@@ -423,7 +423,7 @@ def map_worker(
             final_map = np.mean(final_map.reshape(final_map_height, 2, final_map_width, 2, n_channels), axis=(1, 3))
 
             # Save map array
-            np.savez_compressed(arrays_path/f'array_{mjd1_str}.npz', data=final_map)
+            np.savez_compressed(arrays_path/f'map_{mjd1_str}.npz', data=final_map)
 
             # Uniform compression of six channels into three colors
             # Each color accounts for one-third of the total flow
@@ -433,7 +433,7 @@ def map_worker(
             final_map = np.round(gamma_correction(np.clip(final_map, 0, 1)) * 255).astype(np.uint8)
 
             # Save map image
-            Image.fromarray(final_map).save(images_path/f'image_{mjd1_str}.png')
+            Image.fromarray(final_map).save(images_path/f'map_{mjd1_str}.png')
 
             # Inform main process that worker finished the map
             result_queue.put((True, mjd1_str))
@@ -719,7 +719,7 @@ def main_process(start_date: str, end_date: str):
 
         # Wait five more seconds for the MapWorkers
         for map_p in map_processes:
-            map_p.join(timeout=10)
+            map_p.join(timeout=20)
 
         # If processes are still hanging, kill them forcibly
         for p in all_processes:

@@ -85,12 +85,12 @@ def main_process(start_date: str, end_date: str):
         raise ValueError(f'Observation interval cannot start ({start_date}) later than it ends ({end_date})')
 
     # File names contain MJD epoch at the end of the map
-    # Regex to find the float value after 'array_' and before '.npz'
-    mjd_pattern = re.compile(r'array_([\d.]+)\.npz')
+    # Regex to find the float value after 'map_' and before '.npz'
+    mjd_pattern = re.compile(r'map_([\d.]+)\.npz')
 
     # Collecting the list of maps within the specified time range
     files = []
-    for file in arrays_path.glob('array_*.npz'):
+    for file in arrays_path.glob('map_*.npz'):
         match = mjd_pattern.search(file.name)
         if match:
             mjd = float(match.group(1))
@@ -122,7 +122,7 @@ def main_process(start_date: str, end_date: str):
 
     # Save statistics array
     dates = start_date + '-' + end_date
-    np.savez_compressed(arrays_path/f'stack_stats_{dates}.npz', mean=results[0], median=results[1], stddev=results[2])
+    np.savez_compressed(stacks_path/f'stack_stats_{dates}.npz', mean=results[0], median=results[1], stddev=results[2])
 
     # Save statistic maps
     for stat, stat_name in zip(results, stat_names):
