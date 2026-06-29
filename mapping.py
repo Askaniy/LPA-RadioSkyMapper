@@ -235,10 +235,10 @@ class Epoch:
 
     def to_Time(self) -> Time:
         """
-        Calculates epoch from observation date and hour. LPA uses UTC+5 timezone, returns time in UTC.
-        Tests showed inaccuracy in coordinate determination by observation time, requiring additional shift.
+        Calculates epoch from observation date and hour.
+        LPA uses UTC+5 timezone, returns time in UTC.
         """
-        return Time(self.date_iso) + (self.hour - 5) * u.hour # + 360 * u.s
+        return Time(self.date_iso) + (self.hour - 5) * u.hour
 
     @staticmethod
     def generator(start_obj: dt.datetime, end_obj: dt.datetime) -> Generator:

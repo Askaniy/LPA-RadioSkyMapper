@@ -1,7 +1,8 @@
 # Result folders
+anomalies/
 arrays/
-images/
 calibs/
+images/
 stacks/
 
 # Python-generated files

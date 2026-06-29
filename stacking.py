@@ -2,8 +2,10 @@
 from pathlib import Path
 # Interface and code
 import re
+import warnings
 from typing import cast
 from argparse import ArgumentParser
+from tqdm import tqdm
 # Math and arrays
 import numpy as np
 import numpy.typing as npt
@@ -37,7 +39,7 @@ arrays_path = save_path/'arrays'
 
 # - Result saving paths
 stacks_path = save_path/'stacks'
-#diffs_path = save_path/'diffs'
+anomalies_path = save_path/'anomalies'
 
 
 # === Script Settings ===
@@ -52,6 +54,9 @@ channels = 6
 
 # - Maximum brightness in calibration step units
 br_max_preview = 2
+
+# - Minimum brightness in calibration step units
+br_min_preview = 0.01 # np.finfo(np.float64).eps
 
 # - Color procession
 # Matrix to compress 6 channels into 3 colors
@@ -90,12 +95,14 @@ def main_process(start_date: str, end_date: str):
 
     # Collecting the list of maps within the specified time range
     files = []
+    mjds = []
     for file in arrays_path.glob('map_*.npz'):
         match = mjd_pattern.search(file.name)
         if match:
-            mjd = float(match.group(1))
-            if mjd0 < mjd - 0.5 <= mjd1:
+            mjd = match.group(1)
+            if mjd0 < float(mjd) - 0.5 <= mjd1:
                 files.append(file)
+                mjds.append(mjd)
 
     n_maps = len(files)
     if n_maps == 0:
@@ -103,26 +110,34 @@ def main_process(start_date: str, end_date: str):
 
     # Calculate array size
     shape = (n_maps, height, width, channels)
-    memory_gb = np.prod(shape) * np.dtype(np.float32).itemsize / 1024**3
+    emperical_factor = 5.3
+    memory_gb = emperical_factor * np.prod(shape) * np.dtype(np.float64).itemsize / 1024**3
 
     # User confirmation
-    print(f'- The processing requires approximately {memory_gb * 7:.2f} GB of RAM')
+    print(f'- The processing requires approximately {memory_gb:.2f} GB of RAM')
     input('  Press Enter to continue...')
 
     # Pre-allocate the array
-    all_maps = np.empty(shape, dtype=np.float32)
+    all_maps = np.empty(shape, dtype=np.float64) # sigma_clipped_stats() uses only float64
 
     # Filling the array
-    for i, file in enumerate(files):
-        with np.load(file) as data:
-            all_maps[i] = data['data']
+    with tqdm(total=n_maps, desc='Number of loaded files') as pbar:
+        for i, file in enumerate(files):
+            with np.load(file) as data:
+                all_maps[i] = data['data'].astype(np.float64)
+            pbar.update()
 
     # Compute statistics along axis 0
-    results = sigma_clipped_stats(all_maps, sigma=3.0, maxiters=5, axis=0) # (3, 1800, 3600, 6)
+    print('Computing statistics...')
+    results = sigma_clipped_stats(all_maps, sigma=1., maxiters=5, axis=0) # (3, 1800, 3600, 6)
+    results = cast(tuple[npt.NDArray, npt.NDArray, npt.NDArray], results)
+    print('Statistics is computed, saving...')
 
     # Save statistics array
     dates = start_date + '-' + end_date
-    np.savez_compressed(stacks_path/f'stack_stats_{dates}.npz', mean=results[0], median=results[1], stddev=results[2])
+    stats_file = stacks_path/f'stack_stats_{dates}.npz'
+    np.savez_compressed(stats_file, mean=results[0], median=results[1], stddev=results[2])
+    print(f'Statistics array is saved as {stats_file.name}')
 
     # Save statistic maps
     for stat, stat_name in zip(results, stat_names):
@@ -132,7 +147,34 @@ def main_process(start_date: str, end_date: str):
         # Compress into standard color depth
         rgb = np.round(gamma_correction(np.clip(rgb, 0, 1)) * 255).astype(np.uint8)
         # Save map image
-        Image.fromarray(rgb).save(stacks_path/f'stack_{stat_name}_{dates}.png')
+        stats_file = stacks_path/f'stack_{stat_name}_{dates}.png'
+        Image.fromarray(rgb).save(stats_file)
+        print(f'Map of {stat_name} values is saved as {stats_file.name}')
+
+    # === Anomaly Maps ===
+
+    print('Computing anomaly maps...')
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+
+        # Creating the anomaly maps by division on the mean map
+        # A logarithm is used for readability:
+        # real / mean = 1 -> gray color
+        # real / mean = 10 -> white color
+        # real / mean = 0.1 -> black color
+        all_maps = 255 / 2 * (1. + np.log10(all_maps.clip(br_min_preview) / results[0][np.newaxis, ...].clip(br_min_preview)))
+
+        # Compressing the channels to RGB
+        all_maps = np.einsum('ij, nklj -> nkli', rgb_matrix, all_maps).round().clip(0, 255).astype(np.uint8)
+
+    print('Anomaly maps are computed, saving...')
+
+    # Save anomaly maps
+    with tqdm(total=n_maps, desc='Number of saved anomaly maps') as pbar:
+        for i, mjd in enumerate(mjds):
+            Image.fromarray(all_maps[i]).save(anomalies_path/f'anomaly_map_{mjd}.png')
+            pbar.update()
 
 
 # === Program Entry Point ===
@@ -147,5 +189,5 @@ if __name__ == '__main__':
     else:
         # Check / create path for results
         stacks_path.mkdir(parents=True, exist_ok=True)
-        #diffs_path.mkdir(parents=True, exist_ok=True)
+        anomalies_path.mkdir(parents=True, exist_ok=True)
         main_process(args.date1, args.date2)
