@@ -128,6 +128,9 @@ shared_map_shape = (shared_map_width, n_beams, n_channels)
 f32size = np.dtype(np.float32).itemsize
 shared_map_size = cast(int, np.prod(shared_map_shape) * f32size) # in bytes
 
+# - Math
+tau = 2 * np.pi
+
 
 # === Helper Functions ===
 
@@ -335,7 +338,7 @@ def map_worker(
     xyz_J2000 = np.stack(
         (
             cos_ddec * np.cos(rra),
-            cos_ddec * np.sin(rra),
+            -cos_ddec * np.sin(rra), # `rot_matrix` works right only with the sign
             np.sin(ddec)
         ),
         axis=0
@@ -399,19 +402,27 @@ def map_worker(
                 final_map[..., channel] = CubicSpline(beam_pixels[channel], arr[..., channel], bc_type='natural')(prefinal_map_y)
             final_map = br_max_typical * final_map**3 # fast inverse gamma correction
 
-            # Reprojection to compensate for precession and nutation
-            # A rotation matrix is used to convert coordinates to the J2000 epoch
+            # Compensate for precession and nutation
+            # A rotation matrix converts J2000 coordinates to the current mean epoch
             mean_epoch = Time((mjd0 + mjd1) / 2, format='mjd')
             rot_matrix = erfa.pnm06a(mean_epoch.tt.jd1, mean_epoch.tt.jd2)
             xyz_on_epoch = np.einsum('ij, jkl -> ikl', rot_matrix, xyz_J2000)
-            ra_on_epoch = np.rad2deg(np.arctan2(xyz_on_epoch[1], xyz_on_epoch[0])) % 360
-            dec_on_epoch = np.rad2deg(np.arcsin(xyz_on_epoch[2]))
-            x_on_epoch = RA_to_x(ra_on_epoch, prefinal_map_width)
-            y_on_epoch = dec_to_y(dec_on_epoch, prefinal_map_width)
+            rra_on_epoch = np.arctan2(-xyz_on_epoch[1], xyz_on_epoch[0]) % tau # do not remove %!
+            ddec_on_epoch = np.arcsin(xyz_on_epoch[2])
+
+            # There is a RA shift, which increases with the declination of the sources
+            # I hypothesize a model in which the observation plane is slightly tilted relative to the celestial meridian
+            # The coordinates are shifted along the trajectory of the great circle's projection onto a cylindrical map
+            polar_angle = np.radians(0.32)
+            rra_on_epoch = rra_on_epoch - np.arcsin(np.tan(ddec) * np.tan(polar_angle))
+
+            # Warped reprojection for each channel
+            xx_on_epoch = RA_to_x(np.degrees(rra_on_epoch), prefinal_map_width)
+            yy_on_epoch = dec_to_y(np.degrees(ddec_on_epoch), prefinal_map_width)
             for channel in range_channels:
                 final_map[..., channel] = map_coordinates(
                     final_map[..., channel],
-                    (y_on_epoch, x_on_epoch),
+                    (yy_on_epoch, xx_on_epoch),
                     order=2,
                     mode='wrap',
                     prefilter=False,
