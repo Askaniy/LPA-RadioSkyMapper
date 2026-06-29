@@ -115,8 +115,8 @@ rgb_matrix = np.array((
 n_reg_workers = args.workers # from 1 to 12
 range_reg_workers = range(n_reg_workers) # worker pool
 hours_per_chunk = 4
-n_works = hours_per_chunk * n_regs
-range_works = range(n_works)
+n_reg_works = hours_per_chunk * n_regs
+range_reg_works = range(n_reg_works)
 n_map_workers = 2
 range_map_workers = range(n_map_workers)
 
@@ -652,7 +652,7 @@ def main_process(start_date: str, end_date: str):
                 # Collect results for this chunk
                 completed_works = 0
 
-                while completed_works < n_works:
+                while completed_works < n_reg_works:
                     # Check if any worker died
                     for i, p in enumerate(map_processes):
                         if not p.is_alive():
@@ -662,7 +662,7 @@ def main_process(start_date: str, end_date: str):
                             raise RuntimeError(f'Recorder process {i} crashed!')
 
                     # Poll queues
-                    for _ in range_works:
+                    for _ in range_reg_works:
                         try:
                             success, results = reg_result_queue.get(timeout=0.01)
                             completed_works += 1
@@ -672,15 +672,16 @@ def main_process(start_date: str, end_date: str):
                             break
 
                     # Check map generation and saving status
-                    try:
-                        success, results = map_result_queue.get(timeout=0.01)
-                        if success:
-                            # results = mjd1_str
-                            pbar.write(f'- Sky map up to MJD={results} successfully saved!')
-                        else:
-                            pbar.write(f'! Map generation process error: {results}')
-                    except queue.Empty:
-                        pass
+                    for _ in range_map_workers:
+                        try:
+                            success, results = map_result_queue.get(timeout=0.01)
+                            if success:
+                                # results = mjd1_str
+                                pbar.write(f'- Sky map up to MJD={results} successfully saved!')
+                            else:
+                                pbar.write(f'! Map generation process error: {results}')
+                        except queue.Empty:
+                            break
 
                     # Small pause to avoid overloading CPU in empty loop
                     sleep(0.01)
@@ -702,6 +703,35 @@ def main_process(start_date: str, end_date: str):
                     # Process and save the map
                     map_task_queue.put(map_results)
 
+        # Send Sentinel signal as many times as there are workers in the pool
+        for _ in range_map_workers:
+            map_task_queue.put(None)
+        for _ in range_reg_workers:
+            reg_task_queue.put(None)
+
+        print('Checking that map generation is complete...')
+
+        # Wait for the MapWorkers
+        while True:
+            # Check if workers are still alive
+            if all(not map_p.is_alive() for map_p in map_processes):
+                break
+
+            # Get the last messages
+            for _ in range_map_workers:
+                try:
+                    success, results = map_result_queue.get(timeout=0.01)
+                    if success:
+                        # results = mjd1_str
+                        print(f'- Sky map up to MJD={results} successfully saved!')
+                    else:
+                        print(f'! Map generation process error: {results}')
+                except queue.Empty:
+                    break
+
+            # Small pause to avoid overloading CPU in empty loop
+            sleep(0.01)
+
     except Exception as e:
         print(f'Critical error: {e}')
         raise # Re-raise exception
@@ -709,9 +739,9 @@ def main_process(start_date: str, end_date: str):
     finally:
         print('Shutting down processes...')
 
-        # First, attempt a "soft" stop by sending Sentinel signals
-        # Send Sentinel as many times as there are workers in the pool
-        map_task_queue.put(None)
+        # Send Sentinel signal as many times as there are workers in the pool
+        for _ in range_map_workers:
+            map_task_queue.put(None)
         for _ in range_reg_workers:
             reg_task_queue.put(None)
 
@@ -721,23 +751,19 @@ def main_process(start_date: str, end_date: str):
             dates=calib_dates, hours=calib_hours, calib=shared_calib_array.copy()
         )
 
-        # Cleanup calibration step memory
-        shared_calib_memory.close()
-        try:
-            shared_calib_memory.unlink()
-        except FileNotFoundError:
-            pass
-
-        # Wait five more seconds for the MapWorkers
-        for map_p in map_processes:
-            map_p.join(timeout=20)
-
         # If processes are still hanging, kill them forcibly
         for p in all_processes:
             if p.is_alive():
                 print(f'Process {p.name} did not respond. Forcing termination...')
                 p.terminate() # Fast kill
                 p.join()      # Clean up OS resources
+
+        # Cleanup calibration step memory
+        shared_calib_memory.close()
+        try:
+            shared_calib_memory.unlink()
+        except FileNotFoundError:
+            pass
 
         # Cleanup map memory
         shared_map_memory.close()
