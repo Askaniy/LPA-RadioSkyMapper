@@ -121,7 +121,7 @@ def main_process(start_date: str, end_date: str):
     all_maps = np.empty(shape, dtype=np.float64) # sigma_clipped_stats() uses only float64
 
     # Filling the array
-    with tqdm(total=n_maps, desc='Number of loaded files') as pbar:
+    with tqdm(total=n_maps, desc='Number of loaded map arrays') as pbar:
         for i, file in enumerate(files):
             with np.load(file) as data:
                 all_maps[i] = data['data'].astype(np.float64)
@@ -155,6 +155,10 @@ def main_process(start_date: str, end_date: str):
 
     print('Computing anomaly maps...')
 
+    # Computation depends on the dates interval, so it's not correct to put the results into the same folder
+    anomalies_subfolder = anomalies_path / f'{start_date}_{end_date}'
+    anomalies_subfolder.mkdir(parents=True, exist_ok=True)
+
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
 
@@ -163,6 +167,7 @@ def main_process(start_date: str, end_date: str):
         # real / mean = 1 -> gray color
         # real / mean = 10 -> white color
         # real / mean = 0.1 -> black color
+        # Clipping to avoid negative and close to zero measurements that cause artifacts
         all_maps = 255 / 2 * (1. + np.log10(all_maps.clip(br_min_preview) / results[0][np.newaxis, ...].clip(br_min_preview)))
 
         # Compressing the channels to RGB
@@ -173,7 +178,7 @@ def main_process(start_date: str, end_date: str):
     # Save anomaly maps
     with tqdm(total=n_maps, desc='Number of saved anomaly maps') as pbar:
         for i, mjd in enumerate(mjds):
-            Image.fromarray(all_maps[i]).save(anomalies_path/f'anomaly_map_{mjd}.png')
+            Image.fromarray(all_maps[i]).save(anomalies_subfolder/f'anomaly_map_{mjd}.png')
             pbar.update()
 
 
