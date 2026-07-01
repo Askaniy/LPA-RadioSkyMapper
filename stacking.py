@@ -55,6 +55,10 @@ channels = 6
 # - Maximum brightness in calibration step units
 br_max_preview = 2
 
+# - Dynamic range of variations from the reference map
+anomaly_max_ratio = 5
+anomaly_max_ratio_ln = np.log(anomaly_max_ratio) # to change the base of the logarithm
+
 # - Minimum brightness in calibration step units
 br_min_preview = 0.01 # np.finfo(np.float64).eps
 
@@ -129,7 +133,7 @@ def main_process(start_date: str, end_date: str):
 
     # Compute statistics along axis 0
     print('Computing statistics...')
-    results = sigma_clipped_stats(all_maps, sigma=1., maxiters=5, axis=0) # (3, 1800, 3600, 6)
+    results = sigma_clipped_stats(all_maps, sigma=3., maxiters=5, axis=0) # (3, 1800, 3600, 6)
     results = cast(tuple[npt.NDArray, npt.NDArray, npt.NDArray], results)
     print('Statistics is computed, saving...')
 
@@ -168,7 +172,7 @@ def main_process(start_date: str, end_date: str):
         # real / mean = 10 -> white color
         # real / mean = 0.1 -> black color
         # Clipping to avoid negative and close to zero measurements that cause artifacts
-        all_maps = 255 / 2 * (1. + np.log10(all_maps.clip(br_min_preview) / results[0][np.newaxis, ...].clip(br_min_preview)))
+        all_maps = 255 / 2 * (1. + np.log(all_maps.clip(br_min_preview) / results[0][np.newaxis, ...].clip(br_min_preview)) / anomaly_max_ratio_ln)
 
         # Compressing the channels to RGB
         all_maps = np.einsum('ij, nklj -> nkli', rgb_matrix, all_maps).round().clip(0, 255).astype(np.uint8)
