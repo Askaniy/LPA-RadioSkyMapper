@@ -483,11 +483,12 @@ def reg_worker(
         epoch: Epoch = task[1]
         n_reg: int = task[2]
 
-        # Define height interval on the map
+        # Define vertical interval on the map
         idx_y0, idx_y1 = beam_slices[n_reg]
 
-        # Data indicator
-        data = None
+        # Define horizontal interval on the map
+        idx_x0 = (hour_width1 * i_epoch) % shared_map_width
+        idx_x1 = (idx_x0 + hour_width1) % shared_map_width
 
         try:
             # --- Process raw data from recorder ---
@@ -527,34 +528,34 @@ def reg_worker(
                 warnings.simplefilter('ignore')
                 data = np.nanmedian(data.reshape(hour_width1, hour_factor, *data.shape[1:]), axis=1)
 
-            # Report success
-            result_queue.put((True, None))
-
-        except Exception:
-            # Report error
-            result_queue.put((False, format_exc()))
-
-        finally:
             # Write to shared_array at calculated indices
-            # Even if an error occurs, we must overwrite the previous layer of the cyclic array with a template
-            idx_x0 = (hour_width1 * i_epoch) % shared_map_width
-            idx_x1 = (idx_x0 + hour_width1) % shared_map_width
-
             with shared_map_lock:
                 if idx_x1 < idx_x0:
                     # Emulate cyclicity
                     first_part_len = shared_map_width - idx_x0
-                    if data is None:
-                        shared_map[idx_x0:, idx_y0:idx_y1].fill(0)
-                        shared_map[:idx_x1, idx_y0:idx_y1].fill(0)
-                    else:
-                        shared_map[idx_x0:, idx_y0:idx_y1] = data[:first_part_len]
-                        shared_map[:idx_x1, idx_y0:idx_y1] = data[first_part_len:]
+                    shared_map[idx_x0:, idx_y0:idx_y1] = data[:first_part_len]
+                    shared_map[:idx_x1, idx_y0:idx_y1] = data[first_part_len:]
                 else:
-                    if data is None:
-                        shared_map[idx_x0:idx_x1, idx_y0:idx_y1].fill(0)
-                    else:
-                        shared_map[idx_x0:idx_x1, idx_y0:idx_y1] = data
+                    shared_map[idx_x0:idx_x1, idx_y0:idx_y1] = data
+
+            # Report success
+            result_queue.put((True, None))
+
+        except Exception:
+
+            # Fill the map segment with black values
+            with shared_map_lock:
+                if idx_x1 < idx_x0:
+                    # Emulate cyclicity
+                    first_part_len = shared_map_width - idx_x0
+                    shared_map[idx_x0:, idx_y0:idx_y1].fill(0)
+                    shared_map[:idx_x1, idx_y0:idx_y1].fill(0)
+                else:
+                    shared_map[idx_x0:idx_x1, idx_y0:idx_y1].fill(0)
+
+            # Report error
+            result_queue.put((False, format_exc()))
+
 
 def main_process(start_date: str, end_date: str):
     """ Main process orchestrator """
