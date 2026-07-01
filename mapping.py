@@ -118,7 +118,7 @@ range_reg_workers = range(n_reg_workers) # worker pool
 hours_per_chunk = 4
 n_reg_works = hours_per_chunk * n_regs
 range_reg_works = range(n_reg_works)
-n_map_workers = 4
+n_map_workers = 6
 range_map_workers = range(n_map_workers)
 
 # - Shared memory parameters
@@ -308,6 +308,12 @@ class DailyBuffer:
                 return mjd0, mjd1, map_idx0, map_idx1, calib_idx0, calib_idx1
 
 
+# For the first 8 years, Recorder 0 did not record any observations
+class NoRecorderZero(ValueError):
+    def __init__(self):
+        super().__init__('Recorder 0 is not available at this time')
+
+
 # === Main functions for parallel processes ===
 
 def map_worker(
@@ -388,15 +394,15 @@ def map_worker(
             calib_lights = CubicSpline(step_coords, calib_light, bc_type='natural')(prefinal_map_x).astype(np.float32)
             calib_darks = CubicSpline(step_coords, calib_dark, bc_type='natural')(prefinal_map_x).astype(np.float32)
             calib_lights -= calib_darks
-            arr = (arr - calib_darks) / calib_lights
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                arr = (arr - calib_darks) / calib_lights
 
             # Swap axes: for interpolation and Pillow, height must come first, then width
             arr = arr.swapaxes(0, 1)
 
             # Round MJD to slightly excessive precision ~1s (grid step ~24s)
-            mjd1_str = str(round(mjd1, 5))
-            if len(mjd1_str) == 10:
-                mjd1_str += '0'
+            mjd1_str = f'{mjd1:.5f}'
 
             # Interpolate map channels in height across all pixel values
             # Gamma correction as a temporary solution to help the spline
@@ -478,6 +484,9 @@ def reg_worker(
         if task is None:  # Sentinel signal
             break
 
+        # Flag to fill data with black color
+        success = False
+
         # Unpack task
         i_epoch: int = task[0]
         epoch: Epoch = task[1]
@@ -504,7 +513,10 @@ def reg_worker(
                 if os.path.isfile(file_name):
                     file = file_name
             if file is None:
-                raise FileNotFoundError(f'Files of type {base_name}_**.pnt not found!')
+                if n_reg == 0 and cast(float, epoch.to_Time().mjd) < 59473:
+                    raise NoRecorderZero()
+                else:
+                    raise FileNotFoundError(f'Files of type {base_name}_**.pnt not found!')
 
             # Read recorder data, skip the last (aggregate) channel
             data = read_pntr(file)[..., :-1] # shape [time, beam, channel]
@@ -539,22 +551,29 @@ def reg_worker(
                     shared_map[idx_x0:idx_x1, idx_y0:idx_y1] = data
 
             # Report success
+            success = True
             result_queue.put((True, None))
 
+        except NoRecorderZero:
+            # Do not report error!
+            result_queue.put((True, format_exc()))
+
         except Exception:
-
-            # Fill the map segment with black values
-            with shared_map_lock:
-                if idx_x1 < idx_x0:
-                    # Emulate cyclicity
-                    first_part_len = shared_map_width - idx_x0
-                    shared_map[idx_x0:, idx_y0:idx_y1].fill(0)
-                    shared_map[:idx_x1, idx_y0:idx_y1].fill(0)
-                else:
-                    shared_map[idx_x0:idx_x1, idx_y0:idx_y1].fill(0)
-
             # Report error
             result_queue.put((False, format_exc()))
+
+        finally:
+            if not success:
+                # Fill the map segment with black values
+                with shared_map_lock:
+                    if idx_x1 < idx_x0:
+                        # Emulate cyclicity
+                        first_part_len = shared_map_width - idx_x0
+                        shared_map[idx_x0:, idx_y0:idx_y1].fill(0)
+                        shared_map[:idx_x1, idx_y0:idx_y1].fill(0)
+                    else:
+                        shared_map[idx_x0:idx_x1, idx_y0:idx_y1].fill(0)
+
 
 
 def main_process(start_date: str, end_date: str):
