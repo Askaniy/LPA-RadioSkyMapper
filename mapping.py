@@ -3,6 +3,7 @@ import os
 import queue
 import multiprocessing as mp
 from multiprocessing.shared_memory import SharedMemory
+from multiprocessing.synchronize import Lock as LockType
 from time import sleep
 from pathlib import Path
 # Interface and code
@@ -313,6 +314,7 @@ def map_worker(
         task_queue: mp.Queue,
         result_queue: mp.Queue,
         shared_map_memory_name: str,
+        shared_map_lock: LockType,
         shared_calib_memory_name: str,
         shared_calib_shape: tuple,
         epoch0_mjd: float,
@@ -355,7 +357,8 @@ def map_worker(
             # Change coordinate time direction: when looking from inside the celestial sphere, RA decreases
             # Performed with high precision to avoid rounding errors in np.cumsum()
             map_indices = np.arange(map_idx0, map_idx1)
-            y0 = np.flip(np.take(shared_map, map_indices, mode='wrap', axis=0), axis=0).astype(dtype=np.float64)
+            with shared_map_lock:
+                y0 = np.flip(np.take(shared_map, map_indices, mode='wrap', axis=0), axis=0).astype(dtype=np.float64)
 
             # Define time coordinates on the map
             map_times = epoch0_mjd + (0.5 + map_indices) * hour_width1_step
@@ -456,6 +459,7 @@ def reg_worker(
         task_queue: mp.Queue,
         result_queue: mp.Queue,
         shared_map_memory_name: str,
+        shared_map_lock: LockType,
         shared_calib_memory_name: str,
         shared_calib_shape: tuple
     ):
@@ -534,20 +538,21 @@ def reg_worker(
             idx_x0 = (hour_width1 * i_epoch) % shared_map_width
             idx_x1 = (idx_x0 + hour_width1) % shared_map_width
 
-            if idx_x1 < idx_x0:
-                # Emulate cyclicity
-                first_part_len = shared_map_width - idx_x0
-                if data is None:
-                    shared_map[idx_x0:, idx_y0:idx_y1].fill(0)
-                    shared_map[:idx_x1, idx_y0:idx_y1].fill(0)
+            with shared_map_lock:
+                if idx_x1 < idx_x0:
+                    # Emulate cyclicity
+                    first_part_len = shared_map_width - idx_x0
+                    if data is None:
+                        shared_map[idx_x0:, idx_y0:idx_y1].fill(0)
+                        shared_map[:idx_x1, idx_y0:idx_y1].fill(0)
+                    else:
+                        shared_map[idx_x0:, idx_y0:idx_y1] = data[:first_part_len]
+                        shared_map[:idx_x1, idx_y0:idx_y1] = data[first_part_len:]
                 else:
-                    shared_map[idx_x0:, idx_y0:idx_y1] = data[:first_part_len]
-                    shared_map[:idx_x1, idx_y0:idx_y1] = data[first_part_len:]
-            else:
-                if data is None:
-                    shared_map[idx_x0:idx_x1, idx_y0:idx_y1].fill(0)
-                else:
-                    shared_map[idx_x0:idx_x1, idx_y0:idx_y1] = data
+                    if data is None:
+                        shared_map[idx_x0:idx_x1, idx_y0:idx_y1].fill(0)
+                    else:
+                        shared_map[idx_x0:idx_x1, idx_y0:idx_y1] = data
 
 def main_process(start_date: str, end_date: str):
     """ Main process orchestrator """
@@ -590,6 +595,7 @@ def main_process(start_date: str, end_date: str):
     shared_map_memory = SharedMemory(create=True, size=shared_map_size)
     shared_map_array = np.ndarray(shared_map_shape, dtype=np.float32, buffer=shared_map_memory.buf)
     shared_map_array.fill(0)
+    shared_map_lock = mp.Lock()
 
     # Create queues for recorder data readers
     reg_task_queue = mp.Queue()
@@ -608,10 +614,11 @@ def main_process(start_date: str, end_date: str):
                 map_task_queue,
                 map_result_queue,
                 shared_map_memory.name,
+                shared_map_lock,
                 shared_calib_memory.name,
                 shared_calib_shape,
                 epoch0_mjd,
-                calib_mjds
+                calib_mjds,
             ),
             name=f'MapWorker_{i}'
         )
@@ -627,6 +634,7 @@ def main_process(start_date: str, end_date: str):
                 reg_task_queue,
                 reg_result_queue,
                 shared_map_memory.name,
+                shared_map_lock,
                 shared_calib_memory.name,
                 shared_calib_shape,
             ),
