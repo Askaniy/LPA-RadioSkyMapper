@@ -1,5 +1,7 @@
 # System
 from pathlib import Path
+import multiprocessing as mp
+from multiprocessing.shared_memory import SharedMemory
 # Interface and code
 import re
 import warnings
@@ -26,8 +28,8 @@ parser = ArgumentParser(
 
 parser.add_argument('date1', type=str, help='Start date of observation interval in YYYY-MM-DD format')
 parser.add_argument('date2', type=str, help='End date in YYYY-MM-DD format')
-
-args = parser.parse_args()
+parser.add_argument('--workers', type=int, default=12,
+                    help='Number of parallel processes for reading map arrays')
 
 
 # === Data Locations ===
@@ -80,7 +82,21 @@ def gamma_correction(arr0: npt.NDArray) -> npt.NDArray:
     arr1[~mask] = 1.055 * np.power(arr1[~mask], 1./2.4) - 0.055
     return arr1
 
-def main_process(start_date: str, end_date: str):
+def load_single_map(args_tuple: tuple):
+    """
+    Worker function to load a single .npz file into a shared memory buffer.
+    args_tuple: (file_path, index, shared_array_memory_name, shared_array_shape)
+    """
+    file_path, idx, memory_name, shape = args_tuple
+    # Connect to existing shared memory by name
+    shared_array_memory = SharedMemory(name=memory_name)
+    # Reconstruct the numpy array from shared memory
+    shared_array = np.ndarray(shape, dtype=np.float32, buffer=shared_array_memory.buf)
+    with np.load(file_path) as data:
+        shared_array[idx] = data['data']
+    return idx
+
+def main_process(start_date: str, end_date: str, n_workers: int):
 
     # Date validation
     if start_date == end_date:
@@ -113,77 +129,100 @@ def main_process(start_date: str, end_date: str):
         raise FileNotFoundError(f'No maps found within the time range of {mjd0:.5f}—{mjd1:.5f} MJD')
 
     # Calculate array size
-    shape = (n_maps, height, width, channels)
-    emperical_factor = 5.3
-    memory_gb = emperical_factor * np.prod(shape) * np.dtype(np.float64).itemsize / 1024**3
+    shared_array_shape = (n_maps, height, width, channels)
+    shared_array_size = cast(int, np.prod(shared_array_shape) * np.dtype(np.float32).itemsize) # in bytes
+    empirical_factor = 6.8
+    memory_gb = empirical_factor * shared_array_size / 1024**3 # in Gb
 
     # User confirmation
     print(f'- The processing requires approximately {memory_gb:.2f} GB of RAM')
     input('  Press Enter to continue...')
 
-    # Pre-allocate the array
-    all_maps = np.empty(shape, dtype=np.float64) # sigma_clipped_stats() uses only float64
+    # Allocate the shared array
+    shared_array_memory = SharedMemory(create=True, size=shared_array_size)
+    try:
+        shared_array = np.ndarray(shared_array_shape, dtype=np.float32, buffer=shared_array_memory.buf)
 
-    # Filling the array
-    with tqdm(total=n_maps, desc='Number of loaded map arrays') as pbar:
-        for i, file in enumerate(files):
-            with np.load(file) as data:
-                all_maps[i] = data['data'].astype(np.float64)
-            pbar.update()
+        # Prepare arguments for workers: (path, index, shape, base_pointer)
+        worker_args = [
+            (file, i, shared_array_memory.name, shared_array_shape)
+            for i, file in enumerate(files)
+        ]
 
-    # Compute statistics along axis 0
-    print('Computing statistics...')
-    results = sigma_clipped_stats(all_maps, sigma=3., maxiters=5, axis=0) # (3, 1800, 3600, 6)
-    results = cast(tuple[npt.NDArray, npt.NDArray, npt.NDArray], results)
-    print('Statistics is computed, saving...')
+        print(f'Loading {n_maps} maps using {n_workers} threads...')
+        with mp.Pool(processes=n_workers) as pool:
+            # Using imap/imap_unordered with tqdm to track progress
+            list(tqdm(pool.imap_unordered(load_single_map, worker_args), total=n_maps, desc='Loading maps'))
 
-    # Save statistics array
-    dates = start_date + '-' + end_date
-    stats_file = stacks_path/f'stack_stats_{dates}.npz'
-    np.savez_compressed(stats_file, mean=results[0], median=results[1], stddev=results[2])
-    print(f'Statistics array is saved as {stats_file.name}')
+        # Compute statistics along axis 0
+        print('Computing statistics...')
+        results = sigma_clipped_stats(shared_array, sigma=1., maxiters=5, axis=0) # (3, 1800, 3600, 6)
+        results = cast(tuple[npt.NDArray, npt.NDArray, npt.NDArray], results)
+        print('Statistics is computed, saving...')
 
-    # Save statistic maps
-    for stat, stat_name in zip(results, stat_names):
-        # Uniform compression of six channels into three colors
-        # Each color accounts for one-third of the total flow
-        rgb = np.einsum('ij, klj -> kli', rgb_matrix, stat) / br_max_preview
-        # Compress into standard color depth
-        rgb = np.round(gamma_correction(np.clip(rgb, 0, 1)) * 255).astype(np.uint8)
-        # Save map image
-        stats_file = stacks_path/f'stack_{stat_name}_{dates}.png'
-        Image.fromarray(rgb).save(stats_file)
-        print(f'Map of {stat_name} values is saved as {stats_file.name}')
+        # Computation depends on the dates interval, so it's not correct to put the results into the same folder
+        dates_range_str = f'{start_date}_{end_date}'
+        stacks_subfolder = stacks_path / dates_range_str
+        stacks_subfolder.mkdir(parents=True, exist_ok=True)
+        anomalies_subfolder = anomalies_path / dates_range_str
+        anomalies_subfolder.mkdir(parents=True, exist_ok=True)
 
-    # === Anomaly Maps ===
+        # Save statistics array
+        stats_file = stacks_subfolder/f'stack_stats_{dates_range_str}.npz'
+        np.savez_compressed(stats_file, mean=results[0], median=results[1], stddev=results[2])
+        print(f'Statistics array is saved as {stats_file.name}')
 
-    print('Computing anomaly maps...')
+        # Save statistic maps
+        for stat, stat_name in zip(results, stat_names):
+            # Uniform compression of six channels into three colors
+            # Each color accounts for one-third of the total flow
+            rgb = np.einsum('ij, klj -> kli', rgb_matrix, stat) / br_max_preview
+            # Compress into standard color depth
+            rgb = np.round(gamma_correction(np.clip(rgb, 0, 1)) * 255).astype(np.uint8)
+            # Save map image
+            stats_file = stacks_subfolder/f'stack_{stat_name}_{dates_range_str}.png'
+            Image.fromarray(rgb).save(stats_file)
+            print(f'Map of {stat_name} values is saved as {stats_file.name}')
 
-    # Computation depends on the dates interval, so it's not correct to put the results into the same folder
-    anomalies_subfolder = anomalies_path / f'{start_date}_{end_date}'
-    anomalies_subfolder.mkdir(parents=True, exist_ok=True)
+        # === Anomaly Maps ===
 
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
+        print('Computing anomaly maps...')
 
-        # Creating the anomaly maps by division on the mean map
-        # A logarithm is used for readability:
-        # real / mean = 1 -> gray color
-        # real / mean = 10 -> white color
-        # real / mean = 0.1 -> black color
-        # Clipping to avoid negative and close to zero measurements that cause artifacts
-        all_maps = 255 / 2 * (1. + np.log(all_maps.clip(br_min_preview) / results[0][np.newaxis, ...].clip(br_min_preview)) / anomaly_max_ratio_ln)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
 
-        # Compressing the channels to RGB
-        all_maps = np.einsum('ij, nklj -> nkli', rgb_matrix, all_maps).round().clip(0, 255).astype(np.uint8)
+            # Creating the anomaly maps by division on the mean map
+            # A logarithm is used for readability:
+            # real / mean = 1 -> gray color
+            # real / mean = 10 -> white color
+            # real / mean = 0.1 -> black color
+            # Clipping to avoid negative and close to zero measurements that cause artifacts
+            shared_array = 255 / 2 * (1. + np.log(shared_array.clip(br_min_preview) / results[0][np.newaxis, ...].clip(br_min_preview)) / anomaly_max_ratio_ln)
 
-    print('Anomaly maps are computed, saving...')
+            # Compressing the channels to RGB
+            shared_array = np.einsum('ij, nklj -> nkli', rgb_matrix, shared_array).round().clip(0, 255).astype(np.uint8)
 
-    # Save anomaly maps
-    with tqdm(total=n_maps, desc='Number of saved anomaly maps') as pbar:
-        for i, mjd in enumerate(mjds):
-            Image.fromarray(all_maps[i]).save(anomalies_subfolder/f'anomaly_map_{mjd}.png')
-            pbar.update()
+        print('Anomaly maps are computed, saving...')
+
+        # Save anomaly maps
+        with tqdm(total=n_maps, desc='Number of saved anomaly maps') as pbar:
+            for i, mjd in enumerate(mjds):
+                Image.fromarray(shared_array[i]).save(anomalies_subfolder/f'anomaly_map_{mjd}.png')
+                pbar.update()
+
+    except Exception as e:
+        print(f'Critical error: {e}')
+        raise # Re-raise exception
+
+    finally:
+
+        # Cleanup shared array memory
+        shared_array_memory.close()
+        try:
+            shared_array_memory.unlink()
+        except FileNotFoundError:
+            pass
+
 
 
 # === Program Entry Point ===
@@ -196,7 +235,8 @@ if __name__ == '__main__':
     elif not any(arrays_path.iterdir()):
         raise FileNotFoundError(f'{arrays_path} directory has no data to process!')
     else:
+        args = parser.parse_args()
         # Check / create path for results
         stacks_path.mkdir(parents=True, exist_ok=True)
         anomalies_path.mkdir(parents=True, exist_ok=True)
-        main_process(args.date1, args.date2)
+        main_process(args.date1, args.date2, args.workers)
