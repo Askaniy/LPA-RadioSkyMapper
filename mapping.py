@@ -41,7 +41,7 @@ parser.add_argument('date1', type=str, help='Start date of observation interval 
 parser.add_argument('date2', type=str, help='End date in YYYY-MM-DD format')
 parser.add_argument('--data_path', type=str, default='/bsa_b/',
                     help='Root directory path for LPA data (default: /bsa_b/)')
-parser.add_argument('--workers', type=int, default=6,
+parser.add_argument('--workers', type=int, default=12,
                     help='Number of parallel processes for reading recorder data (from 1 to 12)')
 
 args = parser.parse_args()
@@ -118,7 +118,7 @@ range_reg_workers = range(n_reg_workers) # worker pool
 hours_per_chunk = 4
 n_reg_works = hours_per_chunk * n_regs
 range_reg_works = range(n_reg_works)
-n_map_workers = 2
+n_map_workers = 4
 range_map_workers = range(n_map_workers)
 
 # - Shared memory parameters
@@ -395,6 +395,8 @@ def map_worker(
 
             # Round MJD to slightly excessive precision ~1s (grid step ~24s)
             mjd1_str = str(round(mjd1, 5))
+            if len(mjd1_str) == 10:
+                mjd1_str += '0'
 
             # Interpolate map channels in height across all pixel values
             # Gamma correction as a temporary solution to help the spline
