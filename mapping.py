@@ -28,6 +28,10 @@ from PIL import Image
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import map_coordinates
 
+# Uncomment if datacenter.iers.org is not available
+# from astropy.utils import iers
+# iers.conf.auto_download = False
+
 
 # === Console Input Processing ===
 
