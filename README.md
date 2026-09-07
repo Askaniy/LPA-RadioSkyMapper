@@ -81,12 +81,12 @@ $$\delta = 90^\circ - \frac{Y + 0.5}{10} = 55.3^\circ - \frac{y + 0.5}{10}$$
 LPA saves observations hourly in PNTR format files, separate for each of the three recorders.
 The script uses a multiprocessing architecture with shared memory (`SharedMemory`), which is filled and read cyclically:
 1. **Recorder worker processes**: Up to 12 processes; their task is to process a specific hour for a specific recorder and write the result into a common buffer. Before writing to the ring buffer, the read data is compressed by 27x using median filtering. Calibration steps that interrupt the data stream every 4 hours are measured in these processes and recorded in their own shared memory block. Calibration steps are removed from the data after reading.
-2. **Mapping worker processes**: 4 processes that collect accumulated data from the common buffer, binning them into a pixel grid (with ~5x compression), performing declination interpolation (Cubic Spline), applying coordinate rotation to the J2000 epoch, compressing by 4x, and generating the final map image. The trigger for starting map generation is the presence of two calibration steps—one before and one after the observation interval—ensuring high-quality interpolation of calibration data.
+2. **Mapping worker processes**: 6 processes that collect accumulated data from the common buffer, binning them into a pixel grid (with ~5x compression), performing declination interpolation (Cubic Spline), applying coordinate rotation to the J2000 epoch, compressing by 4x, and generating the final map image. The trigger for starting map generation is the presence of two calibration steps—one before and one after the observation interval—ensuring high-quality interpolation of calibration data.
 3. **Main process**: An orchestrator that distributes tasks in 4-hour chunks to ensure maximum CPU utilization.
 
-Map boundaries are determined by the time of culmination of a point ($\alpha=0$, $\delta=0$), calculated using the `astroplan` library taking Earth's rotation model into account.
+Map boundaries are determined by the time of culmination of a point ($\alpha=0$, $\delta=0$). The calculations are performed by the `astroplan` library taking Earth's rotation model into account.
 When saving, the filename includes a modified Modified Julian Date (MJD) of the map end interval, which corresponds to the left edge.
-Thus, the time on the map is calculated as $T = MJD + \alpha_{source}$.
+Thus, the time on the map is calculated as $T = MJD - 1 + \alpha_{\text{source}}$.
 Five decimal places provide redundant precision (1 s), while the grid step is approximately 24 s.
 
 
@@ -138,12 +138,3 @@ Readings are interpolated using a cubic spline to calibrate the time series via 
 ```math
 F_{obs} = \frac{F_{raw} - D}{L - D}
 ```
-
-The profile of a step in the time series point indices looks as follows:
-- From 3006 to 3008, the shutter closes
-- From 3008 to 3056, the shutter is closed
-- From 3056 to 3058, the calibration source turns on
-- From 3058 to 3106, the calibration source is on
-- From 3106 to 3108, the calibration source turns off
-- From 3108 to 3156, the shutter is closed
-- From 3156 to 3158, the shutter opens
