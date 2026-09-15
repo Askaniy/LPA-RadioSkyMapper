@@ -1,32 +1,38 @@
 # System
+import datetime as dt
+import multiprocessing as mp
 import os
 import queue
-import multiprocessing as mp
-from multiprocessing.shared_memory import SharedMemory
-from multiprocessing.synchronize import Lock as LockType
-from time import sleep
-from pathlib import Path
+
 # Interface and code
 import warnings
-from typing import Generator, cast
 from argparse import ArgumentParser
+from collections.abc import Generator
+from math import floor
+from multiprocessing.shared_memory import SharedMemory
+from multiprocessing.synchronize import Lock as LockType
+from pathlib import Path
+from time import sleep
 from traceback import format_exc
-from tqdm import tqdm
+from typing import cast
+
+import astropy.units as u
+
+# Astronomic calculations
+import erfa
+
 # Math and arrays
 import numpy as np
 import numpy.typing as npt
-from math import floor
-# Astronomic calculations
-import erfa
-import datetime as dt
-import astropy.units as u
-from astropy.time import Time
+from astroplan import FixedTarget, Observer
 from astropy.coordinates import SkyCoord
-from astroplan import Observer, FixedTarget
+from astropy.time import Time
+
 # Image processing
 from PIL import Image
 from scipy.interpolate import CubicSpline
 from scipy.ndimage import map_coordinates
+from tqdm import tqdm
 
 # Uncomment if datacenter.iers.org is not available
 # from astropy.utils import iers
@@ -429,7 +435,7 @@ def map_worker(
             # I hypothesize a model in which the observation plane is slightly tilted relative to the celestial meridian
             # The coordinates are shifted along the trajectory of the great circle's projection onto a cylindrical map
             polar_angle = np.radians(0.32)
-            rra_on_epoch = rra_on_epoch - np.arcsin(np.tan(ddec) * np.tan(polar_angle))
+            rra_on_epoch = rra_on_epoch - np.arcsin(np.tan(ddec_on_epoch) * np.tan(polar_angle))
 
             # Warped reprojection for each channel
             xx_on_epoch = RA_to_x(np.degrees(rra_on_epoch), prefinal_map_width)

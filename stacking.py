@@ -1,22 +1,25 @@
 # System
-from pathlib import Path
 import multiprocessing as mp
-from multiprocessing.shared_memory import SharedMemory
+
 # Interface and code
 import re
 import warnings
-from typing import cast
 from argparse import ArgumentParser
-from tqdm import tqdm
+from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
+from typing import cast
+
 # Math and arrays
 import numpy as np
 import numpy.typing as npt
-# Astronomic calculations
-from astropy.time import Time
-# Image processing
-from PIL import Image
 from astropy.stats import sigma_clipped_stats
 
+# Astronomic calculations
+from astropy.time import Time
+
+# Image processing
+from PIL import Image
+from tqdm import tqdm
 
 # === Console Input Processing ===
 

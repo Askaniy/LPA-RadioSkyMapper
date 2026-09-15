@@ -1,18 +1,20 @@
 # System
-from pathlib import Path
 import multiprocessing as mp
-from multiprocessing.shared_memory import SharedMemory
+
 # Interface and code
 import re
-from typing import cast
 from argparse import ArgumentParser
-from tqdm import tqdm
+from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
+from typing import cast
+
 # Math and arrays
 import numpy as np
 import numpy.typing as npt
+
 # Image processing
 from PIL import Image
-
+from tqdm import tqdm
 
 # === Console Input Processing ===
 
@@ -86,7 +88,7 @@ def load_single_map(args_tuple: tuple):
         shared_array[idx] = data['data'][upper:lower, left:right]
     return idx
 
-def main_process(mjd0: str, mjd1: str, n_workers: int, duration: int|float, crop_box: tuple):
+def main_process(mjd0: str, mjd1: str, n_workers: int, duration: float, crop_box: tuple):
 
     # Date validation
     if mjd0 > mjd1:
