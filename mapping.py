@@ -101,6 +101,10 @@ lpa_latitude = 54.820710 * u.deg
 lpa_elevation = 206 * u.m
 lpa = Observer(latitude=lpa_latitude, longitude=lpa_longitude, elevation=lpa_elevation, timezone='UTC')
 
+# - LPA shifts that were found empirically
+lpa_equatorial_angle = 72 * u.s
+lpa_polar_angle = np.radians(0.42)
+
 # - Beam parameters
 n_beams = 128
 beam_slices = (
@@ -195,6 +199,19 @@ def get_true_equinox(time: Time):
     #     name='True Equinox'
     # )
     return target
+
+def get_transit_time(time: Time, which: str):
+    """
+    Returns the map splitting time, based on the equinox
+    transit time and the LPA equatorial_angle
+    """
+    transit = lpa.target_meridian_transit_time(
+        time,
+        get_true_equinox(time),
+        which
+    )
+    transit -= lpa_equatorial_angle
+    return transit
 
 def read_pntr(file: Path|str) -> npt.NDArray:
     """
@@ -304,18 +321,16 @@ class DailyBuffer:
         self.last_step_idx = -1
         # Declaration of the first map boundaries:
         epoch0 = Time(epoch0_mjd, format='mjd')
-        target = get_true_equinox(epoch0)
-        self.last_transit = lpa.target_meridian_transit_time(epoch0, target, which='previous')
-        self.next_transit = lpa.target_meridian_transit_time(epoch0, target, which='next')
+        self.last_transit = get_transit_time(epoch0, which='previous')
+        self.next_transit = get_transit_time(epoch0, which='next')
         # Calculation of index reference points and map time
         self.start_idx = floor((cast(float, self.last_transit.mjd) - epoch0_mjd) / hour_width1_step) + 1
         self.start_time = epoch0_mjd + self.start_idx * hour_width1_step
 
     def get_next_transit(self, anchor_time: Time) -> Time:
         """ Computes the next transit time of the true equinox """
-        return lpa.target_meridian_transit_time(
+        return get_transit_time(
             anchor_time + 1 * u.hour, # an arbitrary shift is added to ensure distinction between culminations
-            get_true_equinox(anchor_time),
             which='next'
         )
 
@@ -460,13 +475,15 @@ def map_worker(
             rot_matrix = erfa.pnm06a(mean_epoch.tt.jd1, mean_epoch.tt.jd2)
             xyz_on_epoch = np.einsum('ij, jkl -> ikl', rot_matrix, xyz_J2000)
             rra_on_epoch = np.arctan2(xyz_on_epoch[1], xyz_on_epoch[0]) % tau # do not remove %!
-            ddec_on_epoch = np.arcsin(xyz_on_epoch[2])
+            ddec_on_epoch = np.arctan2(
+                xyz_on_epoch[2],
+                np.hypot(xyz_on_epoch[0], xyz_on_epoch[1])
+            )
 
             # There is a RA shift, which increases with the declination of the sources
-            # I hypothesize a model in which the observation plane is slightly tilted relative to the celestial meridian
+            # The observation plane is slightly tilted relative to the celestial meridian
             # The coordinates are shifted along the trajectory of the great circle's projection onto a cylindrical map
-            polar_angle = np.radians(0.32)
-            rra_on_epoch = rra_on_epoch - np.arcsin(np.tan(ddec_on_epoch) * np.tan(polar_angle))
+            rra_on_epoch = rra_on_epoch - np.arcsin(np.tan(ddec_on_epoch) * np.tan(lpa_polar_angle))
 
             # Warped reprojection for each channel
             xx_on_epoch = RA_to_x(np.degrees(rra_on_epoch), prefinal_map_width)
