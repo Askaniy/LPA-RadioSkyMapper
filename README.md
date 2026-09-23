@@ -84,9 +84,9 @@ The script uses a multiprocessing architecture with shared memory (`SharedMemory
 2. **Mapping worker processes**: 6 processes that collect accumulated data from the common buffer, binning them into a pixel grid (with ~5x compression), performing declination interpolation (Cubic Spline), applying coordinate rotation to the J2000 epoch, compressing by 4x, and generating the final map image. The trigger for starting map generation is the presence of two calibration steps—one before and one after the observation interval—ensuring high-quality interpolation of calibration data.
 3. **Main process**: An orchestrator that distributes tasks in 4-hour chunks to ensure maximum CPU utilization.
 
-Map boundaries are determined by the time of culmination of a point ($\alpha=0$, $\delta=0$). The calculations are performed by the `astroplan` library taking Earth's rotation model into account.
-When saving, the filename includes a modified Modified Julian Date (MJD) of the map end interval, which corresponds to the left edge.
-Thus, the time on the map is calculated as $T = MJD - 1 + \alpha_{\text{source}}$.
+Map boundaries are determined by the time of culmination of a point ($\alpha=0$, $\delta=0$). The calculations are performed by the `erfa` and `astroplan` libraries.
+When saving, the filename includes a modified Modified Julian Date (MJD) of the map's right edge (beginning of the mapped interval).
+Thus, the time on the map is calculated as $T = MJD + \alpha_{\text{source}}$.
 Five decimal places provide redundant precision (1 s), while the grid step is approximately 24 s.
 
 

@@ -818,7 +818,7 @@ def main_process(start_date: str, end_date: str):
                             success, results = map_result_queue.get(timeout=0.01)
                             if success:
                                 # results = mjd1_str
-                                pbar.write(f'- Sky map up to MJD={results} successfully saved!')
+                                pbar.write(f'- Sky map beginning at MJD={results} successfully saved!')
                             else:
                                 pbar.write(f'! Map generation process error: {results}')
                         except queue.Empty:
@@ -864,7 +864,7 @@ def main_process(start_date: str, end_date: str):
                     success, results = map_result_queue.get(timeout=0.01)
                     if success:
                         # results = mjd1_str
-                        print(f'- Sky map up to MJD={results} successfully saved!')
+                        print(f'- Sky map beginning at MJD={results} successfully saved!')
                     else:
                         print(f'! Map generation process error: {results}')
                 except queue.Empty:
