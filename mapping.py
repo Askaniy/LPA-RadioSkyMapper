@@ -14,7 +14,7 @@ from multiprocessing.synchronize import Lock as LockType
 from pathlib import Path
 from time import sleep
 from traceback import format_exc
-from typing import cast
+from typing import Literal, cast
 
 import astropy.units as u
 
@@ -281,7 +281,9 @@ def find_calib_step(series: npt.NDArray[np.floating], light_min: float, light_ma
     # Score: dark segments homogeneity with gaussian filter
     # plus correlation with a first derivative template (mean beam, aggregate channel)
     # to select the center with argmax
-    dark_similarity = 1 - np.abs(dark1_median - dark2_median) / (dark1_median + dark2_median)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        dark_similarity = 1 - np.abs(dark1_median - dark2_median) / (dark1_median + dark2_median)
     correlation = np.correlate(np.diff(series.mean(axis=1)[:,-1]), diff_template, mode='same')[x05_length-1:-x05_length+1]
     score = np.where(valid, gaussian_filter(dark_similarity, 10, axes=0) + 0.5 * correlation[:,np.newaxis,np.newaxis], -np.inf)
     best_idx = int(np.median(np.argmax(score, axis=0)))
@@ -305,18 +307,60 @@ def stretch(arr: npt.NDArray, times: int | tuple, copy=False):
     else:
         return np.broadcast_to(arr[..., *new_axes], (*arr.shape, *times))
 
-def linear_interp(x0: npt.NDArray, y0: npt.NDArray, x1: npt.NDArray):
+def linear_interp(
+    x0: npt.NDArray[np.integer | np.floating],
+    y0: npt.NDArray[np.floating],
+    x1: npt.NDArray[np.integer | np.floating],
+    extrap_mode: Literal['linear', 'nearest'] = 'linear'
+) -> npt.NDArray[np.floating]:
     """
-    Analog of `np.interp(x1, x0, y0)`, working for multidimensional data along the first axis.
+    Multivariate linear interpolation with optional extrapolation.
+    Equivalent to the `np.interp(x1, x0, y0)`, but also works for sets and cubes.
+    Allows two extrapolation modes: `linear` and `nearest` (with constant).
     `x0` must be sorted!
     """
-    idx = np.searchsorted(x0, x1).clip(0, x0.size-1)
-    x_left = x0[idx - 1]
-    y_left = y0[idx - 1]
-    delta_x = x0[idx] - x_left
-    delta_y = y0[idx] - y_left
-    slopes = delta_y.T / delta_x
-    y1 = y_left + (slopes * (x1 - x_left)).T
+    len_x0 = len(x0)
+    if len_x0 < 2:
+        raise ValueError('x0 must contain at least 2 elements for interpolation')
+    idx_all = np.searchsorted(x0, x1, side='right')
+    on_right = cast(bool, x1 == x0[-1])
+    if np.any(on_right):
+        idx_all[on_right] = len_x0 - 1
+    interior_mask = (idx_all > 0) & (idx_all < len_x0)
+    idx_interior = idx_all[interior_mask]
+    extra_dims = (1,) * (y0.ndim - 1)  # empty tuple for 1D y0
+    # Interior interpolation
+    if np.any(interior_mask):
+        x_left = x0[idx_interior - 1]
+        y_left = y0[idx_interior - 1]
+        delta_x = x0[idx_interior] - x_left
+        delta_y = y0[idx_interior] - y_left
+        slopes = delta_y / delta_x.reshape(-1, *extra_dims)
+        interp_x = x1[interior_mask]
+        diff_x = (interp_x - x_left).reshape(-1, *extra_dims)
+        interp_y = y_left + slopes * diff_x
+    else:
+        interp_y = np.empty((0, *y0.shape[1:]))
+    if np.all(interior_mask):
+        # All points are interior, no extrapolation needed
+        return interp_y
+    # Prepare output array
+    y1 = np.empty((x1.size, *y0.shape[1:]))
+    y1[interior_mask] = interp_y
+    # Slopes for extrapolation
+    slope_L = slope_R = 0.
+    if extrap_mode == 'linear':
+        slope_L = cast(npt.NDArray[np.floating], (y0[1] - y0[0]) / (x0[1] - x0[0]))
+        slope_R = cast(npt.NDArray[np.floating], (y0[-1] - y0[-2]) / (x0[-1] - x0[-2]))
+    # Fill extrapolation points
+    exterior_mask_L = cast(bool, idx_all == 0)
+    exterior_mask_R = cast(bool, idx_all == len_x0)
+    y1[exterior_mask_L] = (
+        y0[0] + slope_L * cast(npt.NDArray[np.integer | np.floating], x1[exterior_mask_L] - x0[0]).reshape(-1, *extra_dims)
+    )
+    y1[exterior_mask_R] = (
+        y0[-1] + slope_R * cast(npt.NDArray[np.integer | np.floating], x1[exterior_mask_R] - x0[-1]).reshape(-1, *extra_dims)
+    )
     return y1
 
 def gamma_correction(arr0: npt.NDArray) -> npt.NDArray:
@@ -485,93 +529,97 @@ def map_worker(
             x0 = x0[~nan_mask]
             y0 = np.nan_to_num(y0[~nan_mask])
 
-            # --- Binning ---
-            # Auxiliary array of time derivative
-            x0_diff = stretch(np.diff(x0), y0.shape[1:]).astype(dtype=np.float64)
-            # Cumulative integral
-            y_cdf = np.zeros(y0.shape, dtype=np.float64)
-            y_cdf[1:] = np.cumsum(0.5 * (y0[:-1] + y0[1:]) * x0_diff, axis=0) # Riemann sum
-            # Binning the cumulative distribution
-            arr = np.diff(linear_interp(x0, y_cdf, prefinal_map_x_edges), axis=0).astype(np.float32)
+            if len(x0) < 2:
+                result_queue.put((False, f'Cannot build a map from {len(x0)} data points'))
+            else:
+                # --- Binning ---
+                # Auxiliary array of time derivative
+                x0_diff = stretch(np.diff(x0), y0.shape[1:]).astype(dtype=np.float64)
+                # Cumulative integral
+                y_cdf = np.zeros(y0.shape, dtype=np.float64)
+                y_cdf[1:] = np.cumsum(0.5 * (y0[:-1] + y0[1:]) * x0_diff, axis=0) # Riemann sum
+                # Binning the cumulative distribution
+                arr = np.diff(linear_interp(x0, y_cdf, prefinal_map_x_edges), axis=0).astype(np.float32)
 
-            # Interpolation and calibration by steps
-            calib_light = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 0], axis=0)
-            calib_dark = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 1], axis=0)
-            for i in range_regs:
-                # Recorders are processed separately, so if calibration steps have NaN in one recorder, other ones are fine
-                idx0, idx1 = beam_slices[i]
-                mask = ~ np.any(np.isnan(calib_light[:, idx0:idx1]), axis=(1, 2))
-                if mask.any():
-                    calib_lights = CubicSpline(step_coords[mask], calib_light[mask, idx0:idx1], bc_type='natural')(prefinal_map_x).astype(np.float32)
-                    calib_darks = CubicSpline(step_coords[mask], calib_dark[mask, idx0:idx1], bc_type='natural')(prefinal_map_x).astype(np.float32)
-                    calib_lights -= calib_darks
-                    with warnings.catch_warnings():
-                        warnings.simplefilter('ignore')
-                        arr[:, idx0:idx1] = (arr[:, idx0:idx1] - calib_darks) / calib_lights
+                # Interpolation and calibration by steps
+                calib_light = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 0], axis=0)
+                calib_dark = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 1], axis=0)
+                for i in range_regs:
+                    # Recorders are processed separately, so if calibration steps have NaN in one recorder, other ones are fine
+                    idx0, idx1 = beam_slices[i]
+                    mask = ~ np.any(np.isnan(calib_light[:, idx0:idx1]), axis=(1, 2))
+                    valid_step_coords = step_coords[mask]
+                    if len(valid_step_coords) >= 2:
+                        calib_lights = CubicSpline(step_coords[mask], calib_light[mask, idx0:idx1], bc_type='natural')(prefinal_map_x).astype(np.float32)
+                        calib_darks = CubicSpline(step_coords[mask], calib_dark[mask, idx0:idx1], bc_type='natural')(prefinal_map_x).astype(np.float32)
+                        calib_lights -= calib_darks
+                        with warnings.catch_warnings():
+                            warnings.simplefilter('ignore')
+                            arr[:, idx0:idx1] = (arr[:, idx0:idx1] - calib_darks) / calib_lights
 
-            # Swap axes: for interpolation and Pillow, height must come first, then width
-            arr = arr.swapaxes(0, 1)
+                # Swap axes: for interpolation and Pillow, height must come first, then width
+                arr = arr.swapaxes(0, 1)
 
-            # Round MJD to slightly excessive precision ~1s (grid step ~24s)
-            mjd1_str = f'{mjd1:.5f}'
+                # Round MJD to slightly excessive precision ~1s (grid step ~24s)
+                mjd1_str = f'{mjd1:.5f}'
 
-            # Interpolate map channels in height across all pixel values
-            # Gamma correction as a temporary solution to help the spline
-            # Should try ridge regression (Tikhonov regularization with identity matrix)
-            arr = np.clip(np.nan_to_num(arr) / br_max_typical, 0, 1) ** (1/3)
-            final_map = np.empty((prefinal_map_height, prefinal_map_width, n_channels), dtype=np.float32)
-            for channel in range_channels:
-                final_map[..., channel] = CubicSpline(beam_pixels[channel], arr[..., channel], bc_type='natural')(prefinal_map_y)
-            final_map = br_max_typical * final_map**3 # fast inverse gamma correction
+                # Interpolate map channels in height across all pixel values
+                # Gamma correction as a temporary solution to help the spline
+                # Should try ridge regression (Tikhonov regularization with identity matrix)
+                arr = np.clip(np.nan_to_num(arr) / br_max_typical, 0, 1) ** (1/3)
+                final_map = np.empty((prefinal_map_height, prefinal_map_width, n_channels), dtype=np.float32)
+                for channel in range_channels:
+                    final_map[..., channel] = CubicSpline(beam_pixels[channel], arr[..., channel], bc_type='natural')(prefinal_map_y)
+                final_map = br_max_typical * final_map**3 # fast inverse gamma correction
 
-            # Compensate for precession and nutation
-            # A rotation matrix converts J2000 coordinates to the current mean epoch
-            mean_epoch = Time((mjd0 + mjd1) / 2, format='mjd')
-            rot_matrix = erfa.pnm06a(mean_epoch.tt.jd1, mean_epoch.tt.jd2)
-            xyz_on_epoch = np.einsum('ij, jkl -> ikl', rot_matrix, xyz_J2000)
-            rra_on_epoch = np.arctan2(xyz_on_epoch[1], xyz_on_epoch[0]) % tau # do not remove %!
-            ddec_on_epoch = np.arctan2(
-                xyz_on_epoch[2],
-                np.hypot(xyz_on_epoch[0], xyz_on_epoch[1])
-            )
-
-            # There is a RA shift, which increases with the declination of the sources
-            # The observation plane is slightly tilted relative to the celestial meridian
-            # The coordinates are shifted along the trajectory of the great circle's projection onto a cylindrical map
-            rra_on_epoch = rra_on_epoch - np.arcsin(np.tan(ddec_on_epoch) * np.tan(lpa_polar_angle))
-
-            # Warped reprojection for each channel
-            xx_on_epoch = RA_to_x(np.degrees(rra_on_epoch), prefinal_map_width)
-            yy_on_epoch = dec_to_y(np.degrees(ddec_on_epoch), prefinal_map_width)
-            for channel in range_channels:
-                final_map[..., channel] = map_coordinates(
-                    final_map[..., channel],
-                    (yy_on_epoch, xx_on_epoch),
-                    order=2,
-                    mode='wrap',
-                    prefilter=False,
+                # Compensate for precession and nutation
+                # A rotation matrix converts J2000 coordinates to the current mean epoch
+                mean_epoch = Time((mjd0 + mjd1) / 2, format='mjd')
+                rot_matrix = erfa.pnm06a(mean_epoch.tt.jd1, mean_epoch.tt.jd2)
+                xyz_on_epoch = np.einsum('ij, jkl -> ikl', rot_matrix, xyz_J2000)
+                rra_on_epoch = np.arctan2(xyz_on_epoch[1], xyz_on_epoch[0]) % tau # do not remove %!
+                ddec_on_epoch = np.arctan2(
+                    xyz_on_epoch[2],
+                    np.hypot(xyz_on_epoch[0], xyz_on_epoch[1])
                 )
 
-            # Median filtering, 4x compression
-            # After reprojection, the map becomes less clear
-            # Therefore, it is performed at a higher resolution so that the map can then be compressed again
-            final_map = np.mean(final_map.reshape(final_map_height, 2, final_map_width, 2, n_channels), axis=(1, 3))
+                # There is a RA shift, which increases with the declination of the sources
+                # The observation plane is slightly tilted relative to the celestial meridian
+                # The coordinates are shifted along the trajectory of the great circle's projection onto a cylindrical map
+                rra_on_epoch = rra_on_epoch - np.arcsin(np.tan(ddec_on_epoch) * np.tan(lpa_polar_angle))
 
-            # Save map array
-            np.savez_compressed(arrays_path/f'map_{mjd1_str}.npz', data=final_map)
+                # Warped reprojection for each channel
+                xx_on_epoch = RA_to_x(np.degrees(rra_on_epoch), prefinal_map_width)
+                yy_on_epoch = dec_to_y(np.degrees(ddec_on_epoch), prefinal_map_width)
+                for channel in range_channels:
+                    final_map[..., channel] = map_coordinates(
+                        final_map[..., channel],
+                        (yy_on_epoch, xx_on_epoch),
+                        order=2,
+                        mode='wrap',
+                        prefilter=False,
+                    )
 
-            # Uniform compression of six channels into three colors
-            # Each color accounts for one-third of the total flow
-            final_map = np.einsum('ij, klj -> kli', rgb_matrix, final_map) / br_max_preview
+                # Median filtering, 4x compression
+                # After reprojection, the map becomes less clear
+                # Therefore, it is performed at a higher resolution so that the map can then be compressed again
+                final_map = np.mean(final_map.reshape(final_map_height, 2, final_map_width, 2, n_channels), axis=(1, 3))
 
-            # Compress into standard color depth
-            final_map = np.round(gamma_correction(np.clip(final_map, 0, 1)) * 255).astype(np.uint8)
+                # Save map array
+                np.savez_compressed(arrays_path/f'map_{mjd1_str}.npz', data=final_map)
 
-            # Save map image
-            Image.fromarray(final_map).save(images_path/f'map_{mjd1_str}.png')
+                # Uniform compression of six channels into three colors
+                # Each color accounts for one-third of the total flow
+                final_map = np.einsum('ij, klj -> kli', rgb_matrix, final_map) / br_max_preview
 
-            # Inform main process that worker finished the map
-            result_queue.put((True, mjd1_str))
+                # Compress into standard color depth
+                final_map = np.round(gamma_correction(np.clip(final_map, 0, 1)) * 255).astype(np.uint8)
+
+                # Save map image
+                Image.fromarray(final_map).save(images_path/f'map_{mjd1_str}.png')
+
+                # Inform main process that worker finished the map
+                result_queue.put((True, mjd1_str))
 
         except Exception:
             result_queue.put((False, format_exc()))
