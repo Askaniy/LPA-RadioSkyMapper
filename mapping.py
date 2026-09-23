@@ -95,10 +95,12 @@ calib_hours = (1, 5, 9, 13, 17, 21) # hours with calibration steps
 calib_shift = 308 / (24 * 60 * 60) # shift of the step center relative to file start in days
 t_calib = 2400 # Brightness temperature of a calibration step (K)
 ld_ratio_min = 4. # minimum valid light / dark ratio value
-segment_length = 48 # length of each calibration step segment
+segment_length = 50 # length of each calibration step segment
+x3_length = segment_length * 3
+x05_length = int(1.5 * segment_length)
 calib_search_idx0 = 3000 # start index of the interval where should be a step
 calib_search_idx1 = 3200 # end index of the interval where should be a step
-calib_nan_buffer = 25 # indices to skip around calibration step
+calib_nan_buffer = 5 # indices to skip around calibration step
 calib_step_update_date = dt.datetime.fromisoformat('2016-06-27').replace(hour=10)
 
 def get_light_min_max(epoch: dt.datetime):
@@ -252,9 +254,13 @@ def read_pntr(file: Path|str) -> npt.NDArray:
             return filled
         raise ValueError('Undefined data length') # for type checker
 
+# Template of calibration step first derivative
+diff_template = np.zeros(x3_length)
+diff_template[segment_length] = 1.
+diff_template[segment_length * 2] = -1.
+
 def find_calib_step(series: npt.NDArray[np.floating], light_min: float, light_max: float):
     """ Search for calibration step in time series """
-    x3_length = segment_length * 3
     start_idx = 0
     end_idx = len(series) - x3_length + 1
     # Vectorized extraction of all possible positions
@@ -263,18 +269,21 @@ def find_calib_step(series: npt.NDArray[np.floating], light_min: float, light_ma
     idx_light = idx_dark1 + segment_length
     idx_dark2 = idx_light + segment_length
     # Measure all possible segment values
-    dark1_median = np.median(series[idx_dark1], axis=1)
-    light_median = np.median(series[idx_light], axis=1)
-    dark2_median = np.median(series[idx_dark2], axis=1)
+    dark1_median = np.median(series[idx_dark1,...,:-1], axis=1)
+    light_median = np.median(series[idx_light,...,:-1], axis=1)
+    dark2_median = np.median(series[idx_dark2,...,:-1], axis=1)
     # Validate values
     valid = (dark1_median > 0) & (dark2_median > 0) & (light_median > 0)
     valid &= (light_median >= light_min) & (light_median <= light_max)
     valid &= (light_median > ld_ratio_min * dark1_median) & (light_median > ld_ratio_min * dark2_median)
     if not np.any(valid):
         return None
-    # Score: dark segments homogeneity with gaussian filter to select the center with argmax
+    # Score: dark segments homogeneity with gaussian filter
+    # plus correlation with a first derivative template (mean beam, aggregate channel)
+    # to select the center with argmax
     dark_similarity = 1 - np.abs(dark1_median - dark2_median) / (dark1_median + dark2_median)
-    score = np.where(valid, gaussian_filter(dark_similarity, 10), -np.inf)
+    correlation = np.correlate(np.diff(series.mean(axis=1)[:,-1]), diff_template, mode='same')[x05_length-1:-x05_length+1]
+    score = np.where(valid, gaussian_filter(dark_similarity, 10, axes=0) + 0.5 * correlation[:,np.newaxis,np.newaxis], -np.inf)
     best_idx = int(np.median(np.argmax(score, axis=0)))
     # Results
     light_value = light_median[best_idx]
@@ -488,12 +497,17 @@ def map_worker(
             # Interpolation and calibration by steps
             calib_light = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 0], axis=0)
             calib_dark = np.flip(shared_calib[calib_idx0:calib_idx1, ..., 1], axis=0)
-            calib_lights = CubicSpline(step_coords, calib_light, bc_type='natural')(prefinal_map_x).astype(np.float32)
-            calib_darks = CubicSpline(step_coords, calib_dark, bc_type='natural')(prefinal_map_x).astype(np.float32)
-            calib_lights -= calib_darks
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                arr = (arr - calib_darks) / calib_lights
+            for i in range_regs:
+                # Recorders are processed separately, so if calibration steps have NaN in one recorder, other ones are fine
+                idx0, idx1 = beam_slices[i]
+                mask = ~ np.any(np.isnan(calib_light[:, idx0:idx1]), axis=(1, 2))
+                if mask.any():
+                    calib_lights = CubicSpline(step_coords[mask], calib_light[mask, idx0:idx1], bc_type='natural')(prefinal_map_x).astype(np.float32)
+                    calib_darks = CubicSpline(step_coords[mask], calib_dark[mask, idx0:idx1], bc_type='natural')(prefinal_map_x).astype(np.float32)
+                    calib_lights -= calib_darks
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        arr[:, idx0:idx1] = (arr[:, idx0:idx1] - calib_darks) / calib_lights
 
             # Swap axes: for interpolation and Pillow, height must come first, then width
             arr = arr.swapaxes(0, 1)
@@ -617,8 +631,8 @@ def reg_worker(
                 else:
                     raise FileNotFoundError(f'Files of type {base_name}_**.pnt not found!')
 
-            # Read recorder data, skip the last (aggregate) channel
-            data = read_pntr(file)[..., :-1] # shape [time, beam, channel]
+            # Read recorder data
+            data = read_pntr(file) # shape [time, beam, channel]
 
             # Measure calibration steps
             if epoch.hour in calib_hours:
@@ -641,6 +655,9 @@ def reg_worker(
                     nan_idx1 = calib_search_idx0 + step_idx1 + calib_nan_buffer + 1
                     data[nan_idx0:nan_idx1] = np.nan
                     # is around [3017:3172] for the old data and [3004:3161] for the new data
+
+            # Deleting the aggregate channel
+            data = data[..., :-1]
 
             # Data compression: 0.1s resolution is too high for internal processing
             # In one hour, map width / 24 = ~150 px
@@ -665,7 +682,7 @@ def reg_worker(
             success = True
             result_queue.put((True, None))
 
-        except NoRecorderZero:
+        except (NoRecorderZero, FileNotFoundError):
             # Do not report error!
             result_queue.put((True, format_exc()))
 
@@ -680,10 +697,10 @@ def reg_worker(
                     if idx_x1 < idx_x0:
                         # Emulate cyclicity
                         first_part_len = shared_map_width - idx_x0
-                        shared_map[idx_x0:, idx_y0:idx_y1].fill(0)
-                        shared_map[:idx_x1, idx_y0:idx_y1].fill(0)
+                        shared_map[idx_x0:, idx_y0:idx_y1].fill(np.nan)
+                        shared_map[:idx_x1, idx_y0:idx_y1].fill(np.nan)
                     else:
-                        shared_map[idx_x0:idx_x1, idx_y0:idx_y1].fill(0)
+                        shared_map[idx_x0:idx_x1, idx_y0:idx_y1].fill(np.nan)
 
 
 
@@ -719,7 +736,7 @@ def main_process(start_date: str, end_date: str):
     shared_calib_size = cast(int, np.prod(shared_calib_shape) * f32size) # in bytes
     shared_calib_memory = SharedMemory(create=True, size=shared_calib_size)
     shared_calib_array = np.ndarray(shared_calib_shape, dtype=np.float32, buffer=shared_calib_memory.buf)
-    shared_calib_array.fill(0)
+    shared_calib_array.fill(np.nan)
 
     # Create buffer to track map generation conditions
     daily_buffer = DailyBuffer(epoch0_mjd, calib_mjds)
@@ -727,7 +744,7 @@ def main_process(start_date: str, end_date: str):
     # Create unbinned map array shared across all processes
     shared_map_memory = SharedMemory(create=True, size=shared_map_size)
     shared_map_array = np.ndarray(shared_map_shape, dtype=np.float32, buffer=shared_map_memory.buf)
-    shared_map_array.fill(0)
+    shared_map_array.fill(np.nan)
     shared_map_lock = mp.Lock()
 
     # Create queues for recorder data readers
