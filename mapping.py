@@ -31,7 +31,7 @@ from astropy.time import Time
 # Image processing
 from PIL import Image
 from scipy.interpolate import CubicSpline
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates
 from tqdm import tqdm
 
 # Uncomment if datacenter.iers.org is not available
@@ -94,6 +94,16 @@ hour_width1_step = 1 / hour_width1 / 24 # new grid step in days
 calib_hours = (1, 5, 9, 13, 17, 21) # hours with calibration steps
 calib_shift = 308 / (24 * 60 * 60) # shift of the step center relative to file start in days
 t_calib = 2400 # Brightness temperature of a calibration step (K)
+ld_ratio_min = 4. # minimum valid light / dark ratio value
+segment_length = 48 # length of each calibration step segment
+calib_search_idx0 = 3000 # start index of the interval where should be a step
+calib_search_idx1 = 3200 # end index of the interval where should be a step
+calib_nan_buffer = 25 # indices to skip around calibration step
+calib_step_update_date = dt.datetime.fromisoformat('2016-06-27').replace(hour=10)
+
+def get_light_min_max(epoch: dt.datetime):
+    """ Returns minimum and maximum valid light value """
+    return (1.25, 5.) if epoch < calib_step_update_date else (0.5, 2.)
 
 # - LPA parameters
 lpa_longitude = 37.631363 * u.deg
@@ -241,6 +251,37 @@ def read_pntr(file: Path|str) -> npt.NDArray:
             filled[:npoints] = data
             return filled
         raise ValueError('Undefined data length') # for type checker
+
+def find_calib_step(series: npt.NDArray[np.floating], light_min: float, light_max: float):
+    """ Search for calibration step in time series """
+    x3_length = segment_length * 3
+    start_idx = 0
+    end_idx = len(series) - x3_length + 1
+    # Vectorized extraction of all possible positions
+    positions = np.arange(start_idx, end_idx)
+    idx_dark1 = positions[:, None] + np.arange(segment_length)[None, :]
+    idx_light = idx_dark1 + segment_length
+    idx_dark2 = idx_light + segment_length
+    # Measure all possible segment values
+    dark1_median = np.median(series[idx_dark1], axis=1)
+    light_median = np.median(series[idx_light], axis=1)
+    dark2_median = np.median(series[idx_dark2], axis=1)
+    # Validate values
+    valid = (dark1_median > 0) & (dark2_median > 0) & (light_median > 0)
+    valid &= (light_median >= light_min) & (light_median <= light_max)
+    valid &= (light_median > ld_ratio_min * dark1_median) & (light_median > ld_ratio_min * dark2_median)
+    if not np.any(valid):
+        return None
+    # Score: dark segments homogeneity with gaussian filter to select the center with argmax
+    dark_similarity = 1 - np.abs(dark1_median - dark2_median) / (dark1_median + dark2_median)
+    score = np.where(valid, gaussian_filter(dark_similarity, 10), -np.inf)
+    best_idx = int(np.median(np.argmax(score, axis=0)))
+    # Results
+    light_value = light_median[best_idx]
+    dark_value = np.mean([dark1_median[best_idx], dark2_median[best_idx]], axis=0)
+    start = positions[best_idx]
+    end = start + x3_length
+    return light_value, dark_value, start, end
 
 def stretch(arr: npt.NDArray, times: int | tuple, copy=False):
     """
@@ -583,11 +624,23 @@ def reg_worker(
             if epoch.hour in calib_hours:
                 # Define index of the step in global array
                 calib_idx = floor(i_epoch / 4)
-                # 0 = calibration signal (light), 1 = shutter closed level (dark)
-                shared_calib[calib_idx, idx_y0:idx_y1, ..., 0] = np.median(data[3060:3105], axis=0).astype(np.float32)
-                shared_calib[calib_idx, idx_y0:idx_y1, ..., 1] = (np.median(data[3010:3055], axis=0) + np.median(data[3110:3155], axis=0)).astype(np.float32) / 2
-                # Remove calibration step data
-                data[3004:3161] = np.nan
+                # Selecting the interval where the calibration step should be
+                calib_data = data[calib_search_idx0:calib_search_idx1]
+                light_min, light_max = get_light_min_max(dt.datetime.combine(day, dt.time(epoch.hour, 0, 0)))
+                calib_results = find_calib_step(calib_data, light_min, light_max)
+                if calib_results is None:
+                    shared_calib[calib_idx, idx_y0:idx_y1, ..., 0] = np.nan
+                    shared_calib[calib_idx, idx_y0:idx_y1, ..., 1] = np.nan
+                else:
+                    light_value, dark_value, step_idx0, step_idx1 = calib_results
+                    # 0 = calibration signal (light), 1 = shutter closed level (dark)
+                    shared_calib[calib_idx, idx_y0:idx_y1, ..., 0] = light_value.astype(np.float32)
+                    shared_calib[calib_idx, idx_y0:idx_y1, ..., 1] = dark_value.astype(np.float32)
+                    # Remove calibration step data
+                    nan_idx0 = calib_search_idx0 + step_idx0 - calib_nan_buffer
+                    nan_idx1 = calib_search_idx0 + step_idx1 + calib_nan_buffer + 1
+                    data[nan_idx0:nan_idx1] = np.nan
+                    # is around [3017:3172] for the old data and [3004:3161] for the new data
 
             # Data compression: 0.1s resolution is too high for internal processing
             # In one hour, map width / 24 = ~150 px
