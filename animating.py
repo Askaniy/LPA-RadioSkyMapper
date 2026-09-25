@@ -105,7 +105,7 @@ def main_process(mjd0: str, mjd1: str, n_workers: int, duration: float, crop_box
         match = mjd_pattern.search(file.name)
         if match:
             mjd = match.group(1)
-            if mjd0 < float(mjd) - 0.5 <= mjd1:
+            if mjd0 < float(mjd) + 0.5 <= mjd1:
                 files.append(file)
                 mjds.append(mjd)
 

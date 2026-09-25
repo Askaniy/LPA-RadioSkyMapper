@@ -49,6 +49,8 @@ anomalies_path = save_path/'anomalies'
 
 # === Script Settings ===
 
+confirmation_check = False
+
 # - Results
 stat_names = ('mean', 'median', 'stddev')
 
@@ -139,7 +141,8 @@ def main_process(start_date: str, end_date: str, n_workers: int):
 
     # User confirmation
     print(f'- The processing requires approximately {memory_gb:.2f} GB of RAM')
-    input('  Press Enter to continue...')
+    if confirmation_check:
+        input('  Press Enter to continue...')
 
     # Allocate the shared array
     shared_array_memory = SharedMemory(create=True, size=shared_array_size)

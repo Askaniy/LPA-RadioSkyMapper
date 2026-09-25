@@ -100,7 +100,7 @@ x3_length = segment_length * 3
 x05_length = int(1.5 * segment_length)
 calib_search_idx0 = 3000 # start index of the interval where should be a step
 calib_search_idx1 = 3200 # end index of the interval where should be a step
-calib_nan_buffer = 5 # indices to skip around calibration step
+calib_nan_buffer = 15 # indices to skip around calibration step
 calib_step_update_date = dt.datetime.fromisoformat('2016-06-27').replace(hour=10)
 
 def get_light_min_max(epoch: dt.datetime):
